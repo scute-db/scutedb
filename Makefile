@@ -24,26 +24,26 @@ demo:
 	@echo "  make demo-pages  make demo-header"
 
 demo-scan:
-	go run ./cmd/scute-demo scan
+	go run ./cmd/scutedb-demo scan
 
 demo-update:
-	go run ./cmd/scute-demo update
+	go run ./cmd/scutedb-demo update
 
 demo-race:
-	go run -race ./cmd/scute-demo race
+	go run -race ./cmd/scutedb-demo race
 
 demo-crash:
-	go run ./cmd/scute-demo crash
+	go run ./cmd/scutedb-demo crash
 
 demo-pages:
-	go run ./cmd/scute-demo pages
+	go run ./cmd/scutedb-demo pages
 
 demo-header:
-	go run ./cmd/scute-demo header
+	go run ./cmd/scutedb-demo header
 
 hexdump: demo-pages
-	hexdump -C /tmp/scute-pages.db | head -20
+	hexdump -C /tmp/scutedb-pages.db | head -20
 
 clean:
 	go clean ./...
-	rm -f /tmp/scute-pages.db
+	rm -f /tmp/scutedb-pages.db

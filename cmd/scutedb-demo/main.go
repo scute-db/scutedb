@@ -10,14 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/suhailopensource/scute/internal/core"
-	"github.com/suhailopensource/scute/internal/naive"
-	"github.com/suhailopensource/scute/internal/page"
+	"github.com/suhailopensource/ScuteDB/internal/core"
+	"github.com/suhailopensource/ScuteDB/internal/naive"
+	"github.com/suhailopensource/ScuteDB/internal/page"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scute-demo scan|update|race|crash|pages|header")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -42,7 +42,7 @@ func main() {
 }
 
 func tmp(name string) string {
-	dir, _ := os.MkdirTemp("", "scute")
+	dir, _ := os.MkdirTemp("", "scutedb")
 	return filepath.Join(dir, name)
 }
 
@@ -247,7 +247,7 @@ func expPages() {
 	fmt.Println("STEP 0x02  pages")
 	fmt.Print("Three pages, written to a real file.\n\n")
 
-	path := "/tmp/scute-pages.db"
+	path := "/tmp/scutedb-pages.db"
 	os.Remove(path)
 	pf, err := page.Open(path)
 	check(err)
@@ -287,7 +287,7 @@ func expPages() {
 }
 
 func expHeader() {
-	pf, err := page.Open("/tmp/scute-pages.db")
+	pf, err := page.Open("/tmp/scutedb-pages.db")
 	check(err)
 	defer pf.Close()
 	n, err := pf.PageCount()

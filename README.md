@@ -1,4 +1,4 @@
-# scute
+# ScuteDB
 
 A database engine written from scratch in Go, one layer at a time.
 
@@ -173,7 +173,7 @@ Deliberate, each one is a later step:
 ## Layout
 
 ```
-cmd/scute-demo/     the runnable experiments
+cmd/scutedb-demo/     the runnable experiments
 internal/
   core/             PageID, RowID, shared errors
   fileio/           File interface + OSFile
@@ -196,5 +196,5 @@ MIT — see [LICENSE](LICENSE).
 
 Copyright (c) 2026 Syed Suhail Ahmed.
 
-`scute` has no third-party dependencies, so there are no license-compatibility
+`ScuteDB` has no third-party dependencies, so there are no license-compatibility
 constraints to check.

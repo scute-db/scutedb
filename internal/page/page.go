@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/suhailopensource/scute/internal/core"
-	"github.com/suhailopensource/scute/internal/fileio"
+	"github.com/suhailopensource/ScuteDB/internal/core"
+	"github.com/suhailopensource/ScuteDB/internal/fileio"
 )
 
 const Size = 4096
@@ -79,7 +79,7 @@ func (p Page) SetFreeEnd(n uint16)   { binary.BigEndian.PutUint16(p[offFreeEnd:]
 
 func (p Page) Append(b []byte) (uint16, error) {
 	if len(b) > p.FreeSpace() {
-		return 0, fmt.Errorf("scute: %d bytes will not fit in %d free", len(b), p.FreeSpace())
+		return 0, fmt.Errorf("scutedb: %d bytes will not fit in %d free", len(b), p.FreeSpace())
 	}
 	at := p.FreeStart()
 	copy(p[at:], b)
@@ -124,7 +124,7 @@ func (pf *File) Read(id core.PageID) (Page, error) {
 
 func (pf *File) Write(p Page) error {
 	if len(p) != Size {
-		return fmt.Errorf("scute: page is %d bytes, want %d", len(p), Size)
+		return fmt.Errorf("scutedb: page is %d bytes, want %d", len(p), Size)
 	}
 	_, err := pf.f.WriteAt(p, Offset(p.ID()))
 	return err

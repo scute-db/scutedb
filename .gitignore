@@ -1,6 +1,7 @@
-# Binaries (root-anchored, so cmd/scute-demo/ is NOT ignored)
-/scute
-/scute-demo
+# Binaries (root-anchored, so cmd/scutedb-demo/ is NOT ignored)
+/ScuteDB
+/scutedb
+/scutedb-demo
 *.exe
 *.dll
 *.so

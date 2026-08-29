@@ -1,6 +1,6 @@
 package index
 
-import "github.com/suhailopensource/scute/internal/core"
+import "github.com/suhailopensource/ScuteDB/internal/core"
 
 type Iterator interface {
 	Next() bool

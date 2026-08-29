@@ -10,7 +10,7 @@ type RowID struct {
 }
 
 var (
-	ErrNotFound  = errors.New("scute: not found")
-	ErrShortPage = errors.New("scute: short page read")
-	ErrCorrupt   = errors.New("scute: corrupt data")
+	ErrNotFound  = errors.New("scutedb: not found")
+	ErrShortPage = errors.New("scutedb: short page read")
+	ErrCorrupt   = errors.New("scutedb: corrupt data")
 )

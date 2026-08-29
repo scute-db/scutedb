@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/suhailopensource/scute/internal/core"
+	"github.com/suhailopensource/ScuteDB/internal/core"
 )
 
 func TestHeaderRoundTrip(t *testing.T) {
