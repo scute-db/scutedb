@@ -6,7 +6,7 @@ A *scute* is one of the bony plates that make up a turtle's shell. A shell is
 made of plates; a database file is made of pages. 
 
 
-**Status:** Phase 0 complete (3 of 35 steps).
+**Status:** Phase 0 complete more to go a lot of learning and doing.
 
 ---
 
