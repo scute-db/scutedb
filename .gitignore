@@ -1,0 +1,34 @@
+# Binaries (root-anchored, so cmd/scute-demo/ is NOT ignored)
+/scute
+/scute-demo
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test & coverage
+*.test
+*.out
+coverage.*
+
+# Database files produced by demos and tests
+*.db
+*.db.compact
+*.wal
+testdata/tmp/
+
+# Go workspace
+go.work
+go.work.sum
+vendor/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# macOS
+.DS_Store
