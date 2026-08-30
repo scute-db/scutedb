@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/suhailopensource/ScuteDB/internal/core"
+	"github.com/scute-db/scutedb/internal/core"
 )
 
 type DB struct {

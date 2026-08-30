@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/suhailopensource/ScuteDB/internal/codec"
-	"github.com/suhailopensource/ScuteDB/internal/core"
-	"github.com/suhailopensource/ScuteDB/internal/naive"
-	"github.com/suhailopensource/ScuteDB/internal/page"
+	"github.com/scute-db/scutedb/internal/codec"
+	"github.com/scute-db/scutedb/internal/core"
+	"github.com/scute-db/scutedb/internal/naive"
+	"github.com/scute-db/scutedb/internal/page"
 )
 
 func main() {

@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/suhailopensource/ScuteDB/internal/core"
-	"github.com/suhailopensource/ScuteDB/internal/fileio"
+	"github.com/scute-db/scutedb/internal/core"
+	"github.com/scute-db/scutedb/internal/fileio"
 )
 
 const Size = 4096

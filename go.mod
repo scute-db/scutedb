@@ -1,3 +1,3 @@
-module github.com/suhailopensource/ScuteDB
+module github.com/scute-db/scutedb
 
 go 1.22
