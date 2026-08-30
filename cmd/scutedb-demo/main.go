@@ -2,14 +2,19 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/suhailopensource/ScuteDB/internal/codec"
 	"github.com/suhailopensource/ScuteDB/internal/core"
 	"github.com/suhailopensource/ScuteDB/internal/naive"
 	"github.com/suhailopensource/ScuteDB/internal/page"
@@ -17,7 +22,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -33,6 +38,8 @@ func main() {
 		expPages()
 	case "header":
 		expHeader()
+	case "encode":
+		expEncode()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -70,7 +77,7 @@ func expScan() {
 		_, _, _, size, err := db.Stats()
 		check(err)
 		fmt.Printf("%12s  %12s  %14s  %14s\n",
-			commas(int64(n)), bytes(size), el.Round(time.Microsecond),
+			commas(int64(n)), humanBytes(size), el.Round(time.Microsecond),
 			(el / time.Duration(n)).Round(time.Nanosecond))
 		db.Close()
 	}
@@ -100,9 +107,9 @@ func expUpdate() {
 	lines, live, _, after, err := db.Stats()
 	check(err)
 
-	fmt.Printf("  file before update      %s\n", bytes(before))
-	fmt.Printf("  bytes that changed      %s   (the new record)\n", bytes(int64(len(rec))))
-	fmt.Printf("  file after update       %s   (it GREW)\n", bytes(after))
+	fmt.Printf("  file before update      %s\n", humanBytes(before))
+	fmt.Printf("  bytes that changed      %s   (the new record)\n", humanBytes(int64(len(rec))))
+	fmt.Printf("  file after update       %s   (it GREW)\n", humanBytes(after))
 	fmt.Printf("  lines on disk           %s\n", commas(int64(lines)))
 	fmt.Printf("  distinct live keys      %s   <- %s lines are garbage\n\n",
 		commas(int64(live)), commas(int64(lines-live)))
@@ -113,9 +120,9 @@ func expUpdate() {
 	el := time.Since(start)
 
 	fmt.Printf("  To reclaim that space we must rewrite the whole file:\n")
-	fmt.Printf("  compaction wrote        %s in %s\n", bytes(written), el.Round(time.Millisecond))
+	fmt.Printf("  compaction wrote        %s in %s\n", humanBytes(written), el.Round(time.Millisecond))
 	fmt.Printf("  write amplification     %.0fx  (%s written to change %s)\n\n",
-		float64(written)/float64(len(rec)), bytes(written), bytes(int64(len(rec))))
+		float64(written)/float64(len(rec)), humanBytes(written), humanBytes(int64(len(rec))))
 	fmt.Println("  Steps 0x02 and 0x0F fix this: change a 4 KB page, write a 4 KB page.")
 	db.Close()
 }
@@ -173,7 +180,7 @@ func expRace() {
 	fmt.Printf("  damaged records         %s\n", commas(int64(torn)))
 	fmt.Printf("  records LOST            %s\n", commas(int64(1000-good)))
 	fmt.Printf("  file size               %s (expected %s)\n\n",
-		bytes(st.Size()), bytes(int64(1000*len("writer0:record0000\tvalue\n"))))
+		humanBytes(st.Size()), humanBytes(int64(1000*len("writer0:record0000\tvalue\n"))))
 	fmt.Println("  Both goroutines read the same offset and wrote on top of")
 	fmt.Println("  each other. Run this with -race and Go names the exact lines.")
 	fmt.Println("  Step 0x0C is where we make this impossible.")
@@ -219,7 +226,7 @@ func expCrash() {
 	st, _ := os.Stat(path)
 
 	fmt.Printf("  child reported writing  %s records\n", commas(int64(claimed)))
-	fmt.Printf("  actually on disk        %s records  (%s)\n", commas(int64(survived)), bytes(st.Size()))
+	fmt.Printf("  actually on disk        %s records  (%s)\n", commas(int64(survived)), humanBytes(st.Size()))
 	fmt.Printf("  VANISHED                %s records\n\n", commas(int64(claimed-survived)))
 	fmt.Println("  Put() returned nil for every one of those. The records were")
 	fmt.Println("  sitting in a userspace buffer that died with the process -")
@@ -272,7 +279,7 @@ func expPages() {
 	st, err := os.Stat(path)
 	check(err)
 	fmt.Printf("\n  file size    %s  (exactly %d x %d, no more, no less)\n",
-		bytes(st.Size()), st.Size()/page.Size, page.Size)
+		humanBytes(st.Size()), st.Size()/page.Size, page.Size)
 
 	pf2, err := page.Open(path)
 	check(err)
@@ -330,7 +337,7 @@ func commas(n int64) string {
 	return string(out)
 }
 
-func bytes(n int64) string {
+func humanBytes(n int64) string {
 	switch {
 	case n < 1024:
 		return fmt.Sprintf("%d B", n)
@@ -339,4 +346,78 @@ func bytes(n int64) string {
 	default:
 		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
 	}
+}
+
+func expEncode() {
+	fmt.Println("STEP 0x03  binary serialization")
+
+	fmt.Print("\n1. THE PROBLEM LEFT OVER FROM 0x02\n\n")
+	p := page.New(1, page.KindHeap)
+	p.Append([]byte("scute-db"))
+	p.Append([]byte("hello"))
+	fmt.Printf("   raw appends:   %q\n", string(p[page.HeaderSize:p.FreeStart()]))
+	fmt.Println("   two items, nothing marks the boundary. unrecoverable.")
+
+	fmt.Print("\n2. THE FIX: LENGTH PREFIXING\n\n")
+	q := page.New(1, page.KindHeap)
+	q.Append(codec.AppendString(nil, "scute-db"))
+	q.Append(codec.AppendString(nil, "hello"))
+	body := q[page.HeaderSize:q.FreeStart()]
+	fmt.Printf("   bytes:         % 02X\n", body)
+	fmt.Printf("   as text:       %q\n", string(body))
+	off := 0
+	for i := 1; off < len(body); i++ {
+		s, n, err := codec.String(body[off:])
+		if err != nil {
+			fmt.Println("   decode error:", err)
+			break
+		}
+		fmt.Printf("   item %d:        len=%-3d %-12q bytes %d..%d\n", i, len(s), s, off, off+n-1)
+		off += n
+	}
+
+	fmt.Print("\n3. FIXED WIDTH vs VARINT\n\n")
+	fmt.Printf("   %-22s %-10s %-10s %s\n", "value", "fixed 8B", "varint", "saved")
+	fmt.Println("   " + line(56))
+	for _, v := range []uint64{0, 1, 127, 128, 1000, 1 << 20, 1 << 40, math.MaxUint64} {
+		n := len(codec.AppendUvarint(nil, v))
+		fmt.Printf("   %-22d %-10d %-10d %+d bytes\n", v, 8, n, 8-n)
+	}
+
+	fmt.Print("\n4. WHY KEYS MUST BE BIG-ENDIAN\n\n")
+	nums := []uint64{1, 2, 255, 256, 300}
+	fmt.Printf("   %-8s %-27s %s\n", "value", "big-endian (low 4 bytes)", "varint")
+	fmt.Println("   " + line(52))
+	for _, v := range nums {
+		be := codec.AppendKeyUint64(nil, v)
+		fmt.Printf("   %-8d %-27s % 02X\n", v, fmt.Sprintf("% 02X", be[4:]), codec.AppendUvarint(nil, v))
+	}
+	fmt.Print("\n   the same five values, sorted purely by their bytes:\n")
+	fmt.Printf("     big-endian     %v   correct\n",
+		sortedBy(nums, func(v uint64) []byte { return codec.AppendKeyUint64(nil, v) }))
+	fmt.Printf("     little-endian  %v   wrong\n",
+		sortedBy(nums, func(v uint64) []byte { return binary.LittleEndian.AppendUint64(nil, v) }))
+	fmt.Printf("     varint         %v   wrong\n",
+		sortedBy(nums, func(v uint64) []byte { return codec.AppendUvarint(nil, v) }))
+	fmt.Println("\n   The B+Tree will compare keys with bytes.Compare and nothing else.")
+	fmt.Println("   Only the first encoding survives that.")
+
+	fmt.Print("\n5. SIGNED KEYS NEED A SIGN FLIP\n\n")
+	fmt.Printf("   %-8s %-26s %s\n", "value", "raw two's complement", "key encoding")
+	fmt.Println("   " + line(60))
+	for _, v := range []int64{-2, -1, 0, 1, 2} {
+		raw := binary.BigEndian.AppendUint64(nil, uint64(v))
+		fmt.Printf("   %-8d %-26s % 02X\n", v,
+			fmt.Sprintf("% 02X", raw), codec.AppendKeyInt64(nil, v))
+	}
+	fmt.Println("\n   Raw, -1 is all FF bytes and sorts ABOVE 1. Flipping the top bit")
+	fmt.Println("   shifts the signed range so bytewise order matches numeric order.")
+}
+
+func sortedBy(nums []uint64, enc func(uint64) []byte) []uint64 {
+	out := append([]uint64(nil), nums...)
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(enc(out[i]), enc(out[j])) < 0
+	})
+	return out
 }
