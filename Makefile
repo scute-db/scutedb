@@ -1,4 +1,4 @@
-.PHONY: all test race vet fmt lint bench demo clean
+.PHONY: all test race vet fmt lint bench demo fuzz clean
 
 all: fmt vet test
 
@@ -47,3 +47,11 @@ hexdump: demo-pages
 clean:
 	go clean ./...
 	rm -f /tmp/scutedb-pages.db
+
+demo-encode:
+	go run ./cmd/scutedb-demo encode
+
+fuzz:
+	go test ./internal/codec/ -run=XXX -fuzz=FuzzValueRoundTrip -fuzztime=30s
+	go test ./internal/codec/ -run=XXX -fuzz=FuzzKeyOrderingInt64 -fuzztime=30s
+	go test ./internal/codec/ -run=XXX -fuzz=FuzzDecoderNeverPanics -fuzztime=30s
