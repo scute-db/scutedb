@@ -217,12 +217,100 @@ value   raw two's complement      key encoding
 Floats use the same idea: flip the sign bit if positive, flip every bit if
 negative.
 
-**Round-trip property tests.** Table tests cover the specific cases; three Go
-fuzz targets cover the rest — value round-tripping, key order preservation
-(`a < b` must imply `bytes.Compare < 0`, for every pair the fuzzer can find),
-and that no decoder panics on arbitrary input. Roughly 480k executions/sec.
+**Round-trip property tests.** Table tests cover the specific cases; four Go
+fuzz targets cover the rest — value round-tripping, integer and float key order
+preservation (`a < b` must imply `bytes.Compare < 0`, for every pair the fuzzer
+can find), and that no decoder panics on arbitrary input. Roughly 430–480k
+executions/sec.
+
+Two correctness details the float fuzzer exists to protect:
+
+- **`-0.0` is normalised to `+0.0` before encoding.** IEEE-754 says they are
+  equal, but their bit patterns differ maximally, so without normalisation an
+  index would place them at opposite ends and `WHERE x = 0.0` would miss rows
+  stored as `-0.0`.
+- **All NaN payloads canonicalise to one.** NaN has many bit patterns; without
+  this, two NaNs would be different index keys. They sort above every real
+  number, matching Postgres.
+
+**`Bytes` copies, `BytesRef` does not.** `BytesRef` returns a view into the
+caller's buffer for hot paths; `Bytes` copies. The distinction matters because
+page buffers are recycled by the buffer pool, so a view outlives its backing
+bytes. The name is the only warning, so the split is deliberate rather than a
+single ambiguous function.
 
 Run it: `make demo-encode`.
+
+### `0x04` Nulls
+
+A byte of zeros in a page is ambiguous: it may be the number `0`, or a field
+that was never given a value. Those mean different things and must be
+distinguishable.
+
+Sentinel values (`-1`, `0`, `MinInt64`, `""`) do not work, because every
+sentinel removes a legal value from the type's range. MySQL's `0000-00-00` date
+and the `-1` "no sensor reading" convention are the same mistake in production.
+
+`internal/nullbits` puts the answer outside the data instead: a **bitmap in the
+record header**, one bit per field.
+
+```
+field    value      stored?
+id       42         yes
+name     suhail     yes
+age      NULL       NO - 0 bytes
+email    NULL       NO - 0 bytes
+score    9.1        yes
+
+bitmap:   ..NN.---   (N null, . present, - padding)
+record:   0C 54 06 73 75 68 61 69 6C 40 22 33 33 33 33 33 33
+          ^^ header, then only the three present values
+```
+
+Two consequences worth stating explicitly:
+
+- **A null field occupies zero bytes.** The bitmap is not a description of the
+  data, it is the only record that the field exists at all.
+- **The bitmap must precede the values.** A reader cannot parse the value area
+  without first knowing which fields were skipped. This is why it lives in the
+  header, and it is why Postgres puts `t_bits` in its tuple header.
+
+One bit per field rather than one byte: a 32-column row spends 4 bytes instead
+of 32.
+
+The bitmap is sized in whole bytes, so a 5-field record has 3 unused trailing
+bits. The bitmap does not know the field count — the schema does. `Describe`
+renders padding as `-` so this is visible rather than misleading.
+
+**Three-valued logic.** SQL's `NULL` means *unknown*, not *empty*, which makes
+comparison return `UNKNOWN` rather than true or false. `internal/nullbits`
+implements `Bool3` with the SQL truth tables. The consequence:
+
+```
+age is NULL
+
+age = 30                  -> UNKNOWN
+age != 30                 -> UNKNOWN
+age = 30 OR age != 30     -> UNKNOWN
+WHERE keeps the row?      -> false
+```
+
+A condition that holds for every number that exists still excludes the row,
+because `WHERE` keeps `TRUE` only. That is why SQL needs `IS NULL` as separate
+syntax: `= NULL` can never be true.
+
+Unknown does not always propagate — `FALSE AND UNKNOWN` is `FALSE`, because the
+answer is already decided. The truth tables are pinned by test.
+
+Two API details that fall out of getting this right:
+
+- `Count(fields)` and `Any(fields)` take the field count rather than reading the
+  whole bitmap. A bitmap is sized in whole bytes, so a corrupt or stray padding
+  bit would otherwise be reported as a phantom null field.
+- `Bool3` normalises out-of-range values to `UNKNOWN`, so a garbage value cannot
+  make `AND` return `TRUE`.
+
+Run it: `make demo-nulls`.
 
 ### Known gaps at the end of Phase 0
 
@@ -248,6 +336,7 @@ internal/
   naive/            the throwaway from 0x01
   page/             fixed-size pages, header codec, header decoder
   codec/            value encoding (compact) and key encoding (ordered)
+  nullbits/         null bitmaps and SQL three-valued logic
 ```
 
 ## Conventions

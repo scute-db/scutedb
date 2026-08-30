@@ -43,16 +43,29 @@ func AppendBytes(dst []byte, b []byte) []byte {
 	return append(dst, b...)
 }
 
-func Bytes(src []byte) ([]byte, int, error) {
+func BytesRef(src []byte) ([]byte, int, error) {
 	n, hdr, err := Uvarint(src)
 	if err != nil {
 		return nil, 0, err
 	}
+	if n > uint64(len(src)) {
+		return nil, 0, ErrTruncated
+	}
 	end := hdr + int(n)
-	if n > uint64(len(src)) || end > len(src) || end < hdr {
+	if end > len(src) || end < hdr {
 		return nil, 0, ErrTruncated
 	}
 	return src[hdr:end], end, nil
+}
+
+func Bytes(src []byte) ([]byte, int, error) {
+	ref, n, err := BytesRef(src)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]byte, len(ref))
+	copy(out, ref)
+	return out, n, nil
 }
 
 func AppendString(dst []byte, s string) []byte {
@@ -61,7 +74,7 @@ func AppendString(dst []byte, s string) []byte {
 }
 
 func String(src []byte) (string, int, error) {
-	b, n, err := Bytes(src)
+	b, n, err := BytesRef(src)
 	if err != nil {
 		return "", 0, err
 	}
