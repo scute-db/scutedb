@@ -90,3 +90,44 @@ func FuzzDecoderNeverPanics(f *testing.F) {
 		KeyFloat64(data)
 	})
 }
+
+func FuzzKeyOrderingFloat64(f *testing.F) {
+	f.Add(0.0, 1.0)
+	f.Add(math.Copysign(0, -1), 0.0)
+	f.Add(math.Inf(-1), math.Inf(1))
+	f.Add(math.NaN(), 1.0)
+
+	f.Fuzz(func(t *testing.T, a, b float64) {
+		ea := AppendKeyFloat64(nil, a)
+		eb := AppendKeyFloat64(nil, b)
+		got := bytes.Compare(ea, eb)
+
+		aNaN, bNaN := math.IsNaN(a), math.IsNaN(b)
+		switch {
+		case aNaN && bNaN:
+			if got != 0 {
+				t.Fatalf("two NaNs compared %d, want 0", got)
+			}
+		case aNaN:
+			if got <= 0 {
+				t.Fatalf("NaN vs %v compared %d, want > 0", b, got)
+			}
+		case bNaN:
+			if got >= 0 {
+				t.Fatalf("%v vs NaN compared %d, want < 0", a, got)
+			}
+		case a < b:
+			if got >= 0 {
+				t.Fatalf("%v < %v but bytes compared %d", a, b, got)
+			}
+		case a > b:
+			if got <= 0 {
+				t.Fatalf("%v > %v but bytes compared %d", a, b, got)
+			}
+		default:
+			if got != 0 {
+				t.Fatalf("%v == %v but bytes compared %d\n  % 02X\n  % 02X", a, b, got, ea, eb)
+			}
+		}
+	})
+}

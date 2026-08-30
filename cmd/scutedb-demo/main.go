@@ -17,12 +17,13 @@ import (
 	"github.com/scute-db/scutedb/internal/codec"
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/naive"
+	"github.com/scute-db/scutedb/internal/nullbits"
 	"github.com/scute-db/scutedb/internal/page"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -40,6 +41,8 @@ func main() {
 		expHeader()
 	case "encode":
 		expEncode()
+	case "nulls":
+		expNulls()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -420,4 +423,123 @@ func sortedBy(nums []uint64, enc func(uint64) []byte) []uint64 {
 		return bytes.Compare(enc(out[i]), enc(out[j])) < 0
 	})
 	return out
+}
+
+func expNulls() {
+	fmt.Println("STEP 0x04  nulls and the zero problem")
+
+	fmt.Print("\n1. THE PROBLEM\n\n")
+	p := page.New(1, page.KindHeap)
+	p.Append(codec.AppendInt64(nil, 0))
+	body := p[page.HeaderSize : page.HeaderSize+8]
+	fmt.Printf("   a slot holding the number 0:   % 02X\n", body[:1])
+	fmt.Printf("   an untouched slot:             % 02X\n", p[100:101])
+	fmt.Println("   identical bytes. 'age is 0' and 'age was never given' are")
+	fmt.Println("   indistinguishable, and they mean completely different things.")
+
+	fmt.Print("\n2. THE TEMPTING FIX: A SENTINEL VALUE\n\n")
+	fmt.Println("   pick a magic value to mean 'missing':")
+	fmt.Printf("   %-22s %s\n", "sentinel", "what you can no longer store")
+	fmt.Println("   " + line(56))
+	for _, c := range [][2]string{
+		{"-1", "any legitimately negative value"},
+		{"0", "a real zero: a balance, a count, a temperature"},
+		{"math.MinInt64", "the smallest valid integer"},
+		{"\"\" (empty string)", "an intentionally blank field"},
+	} {
+		fmt.Printf("   %-22s %s\n", c[0], c[1])
+	}
+	fmt.Println("\n   every sentinel steals a legal value out of the type's range.")
+	fmt.Println("   MySQL's 0000-00-00 date and the -1 'no reading' sensor convention")
+	fmt.Println("   are the same mistake, shipped.")
+
+	fmt.Print("\n3. THE FIX: A NULL BITMAP IN THE RECORD HEADER\n\n")
+	names := []string{"id", "name", "age", "email", "score"}
+	values := []any{int64(42), "suhail", nil, nil, 9.1}
+
+	bm := nullbits.New(len(names))
+	var data []byte
+	for i, v := range values {
+		if v == nil {
+			bm.SetNull(i)
+			continue
+		}
+		switch x := v.(type) {
+		case int64:
+			data = codec.AppendInt64(data, x)
+		case string:
+			data = codec.AppendString(data, x)
+		case float64:
+			data = codec.AppendFloat64(data, x)
+		}
+	}
+	record := append(append([]byte(nil), bm...), data...)
+
+	fmt.Printf("   %-8s %-10s %s\n", "field", "value", "stored?")
+	fmt.Println("   " + line(40))
+	for i, n := range names {
+		mark, v := "yes", fmt.Sprint(values[i])
+		if bm.IsNull(i) {
+			mark, v = "NO - 0 bytes", "NULL"
+		}
+		fmt.Printf("   %-8s %-10s %s\n", n, v, mark)
+	}
+	fmt.Printf("\n   bitmap:   %s   (%d byte; N null, . present, - padding)\n", bm.Describe(len(names)), len(bm))
+	fmt.Printf("   raw:      % 02X\n", []byte(bm))
+	fmt.Printf("   record:   % 02X\n", record)
+	fmt.Printf("             ^^ header, then only the %d present values\n", len(names)-bm.Count(len(names)))
+
+	off := len(bm)
+	fmt.Println("\n   decoding: the bitmap tells the reader which fields to expect")
+	for i, n := range names {
+		if bm.IsNull(i) {
+			fmt.Printf("     %-8s NULL          (skip, nothing was written)\n", n)
+			continue
+		}
+		switch i {
+		case 0:
+			v, adv, _ := codec.Int64(record[off:])
+			fmt.Printf("     %-8s %-13d bytes %d..%d\n", n, v, off, off+adv-1)
+			off += adv
+		case 1:
+			v, adv, _ := codec.String(record[off:])
+			fmt.Printf("     %-8s %-13q bytes %d..%d\n", n, v, off, off+adv-1)
+			off += adv
+		case 4:
+			v, adv, _ := codec.Float64(record[off:])
+			fmt.Printf("     %-8s %-13v bytes %d..%d\n", n, v, off, off+adv-1)
+			off += adv
+		}
+	}
+
+	fmt.Print("\n4. WHY A BITMAP AND NOT A FLAG BYTE PER FIELD\n\n")
+	fmt.Printf("   %-10s %-16s %-16s %s\n", "fields", "1 flag byte each", "bitmap", "saved per row")
+	fmt.Println("   " + line(60))
+	for _, n := range []int{5, 8, 32, 100} {
+		fmt.Printf("   %-10d %-16d %-16d %d bytes\n", n, n, nullbits.Size(n), n-nullbits.Size(n))
+	}
+
+	fmt.Print("\n5. NULL IS NOT A VALUE. IT IS 'UNKNOWN'.\n\n")
+	all := []nullbits.Bool3{nullbits.True, nullbits.False, nullbits.Unknown}
+	fmt.Printf("   %-24s %-10s %-10s %s\n", "", "AND", "OR", "")
+	for _, a := range all {
+		for _, b := range all {
+			fmt.Printf("   %-9v %-9v -> %-9v %-9v\n", a, b, a.And(b), a.Or(b))
+		}
+	}
+	fmt.Println("\n   note FALSE AND UNKNOWN = FALSE, and TRUE OR UNKNOWN = TRUE.")
+	fmt.Println("   unknown does not always spread; sometimes the answer is already decided.")
+
+	fmt.Print("\n6. THE CONSEQUENCE\n\n")
+	var age *int64
+	thirty := int64(30)
+	eq := nullbits.EqualInt64(age, &thirty)
+	fmt.Printf("   age is NULL\n\n")
+	fmt.Printf("   age = 30                  -> %v\n", eq)
+	fmt.Printf("   age != 30                 -> %v\n", eq.Not())
+	fmt.Printf("   age = 30 OR age != 30     -> %v\n", eq.Or(eq.Not()))
+	fmt.Printf("   WHERE keeps the row?      -> %v\n", eq.Or(eq.Not()).IsTrue())
+	fmt.Println("\n   a condition that is true for every number alive excludes this row.")
+	fmt.Println("   WHERE keeps TRUE only, never UNKNOWN. this is why SQL needs IS NULL:")
+	fmt.Printf("   age IS NULL               -> %v\n", nullbits.IsNull(age))
 }

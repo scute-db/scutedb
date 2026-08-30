@@ -55,3 +55,6 @@ fuzz:
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzValueRoundTrip -fuzztime=30s
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzKeyOrderingInt64 -fuzztime=30s
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzDecoderNeverPanics -fuzztime=30s
+
+demo-nulls:
+	go run ./cmd/scutedb-demo nulls

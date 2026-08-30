@@ -30,6 +30,12 @@ func KeyInt64(src []byte) (int64, int, error) {
 }
 
 func AppendKeyFloat64(dst []byte, f float64) []byte {
+	if f == 0 {
+		f = 0
+	}
+	if math.IsNaN(f) {
+		f = math.NaN()
+	}
 	b := math.Float64bits(f)
 	if b&signBit != 0 {
 		b = ^b
