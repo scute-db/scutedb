@@ -23,14 +23,14 @@ make hexdump               # write real pages and look at the bytes
 
 ## Roadmap
 
-| Phase | What | Steps | Status |
-|-------|------|-------|--------|
-| **0** | Foundations — interfaces, the naive database, pages | `0x00`–`0x02` | **done** |
-| A | Bytes & the B+Tree | `0x03`–`0x08` | **in progress** |
-| B | Persistence — storage manager, buffer pool, locking | `0x09`–`0x0D` | |
-| C | A real data store — schema, rows, indexes | `0x0E`–`0x12` | |
-| D | Transactions — WAL, recovery, 2PL, MVCC | `0x13`–`0x1A` | |
-| E | Beyond — LSM engine, Raft, server, query planner | `0x1B`–`0x22` | |
+| Phase | What | Status |
+|-------|------|--------|
+| **0** | Foundations — interfaces, the naive database, pages | **done** |
+| A | Bytes & the B+Tree | **in progress** |
+| B | Persistence — storage manager, buffer pool, locking | |
+| C | A real data store — schema, rows, indexes | |
+| D | Transactions — WAL, recovery, 2PL, MVCC | |
+| E | Beyond — LSM engine, Raft, server, query planner | |
 
 ---
 
