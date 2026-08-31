@@ -58,3 +58,6 @@ fuzz:
 
 demo-nulls:
 	go run ./cmd/scutedb-demo nulls
+
+demo-align:
+	go run ./cmd/scutedb-demo align

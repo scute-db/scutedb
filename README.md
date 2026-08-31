@@ -312,6 +312,71 @@ Two API details that fall out of getting this right:
 
 Run it: `make demo-nulls`.
 
+### `0x05` Alignment and padding
+
+`internal/slots` lays fixed-size records out inside a page so that any slot is
+reachable by arithmetic rather than by scanning.
+
+```
+slot     offset       how it is found
+0        16           16 + 0 x 16
+1        32           16 + 1 x 16
+199      3200         16 + 199 x 16
+```
+
+Measured against packed, length-prefixed records in the same page:
+
+```
+fixed slot, first          4-6 ns
+fixed slot, 200th          4-5 ns     flat
+packed record, first       6-7 ns
+packed record, 200th       ~990 ns    about 200x slower
+```
+
+The fixed layout does not care which slot you ask for. The packed layout has to
+decode every record before the one it wants.
+
+Ranges rather than single figures on purpose: across three runs this
+microbenchmark varies by about 1.7 ns, so the fixed-slot first and 200th figures
+overlap. That overlap *is* the result — the cost does not depend on the index.
+The packed 200th figure is stable to within 4 ns, because 990 ns of real work
+drowns out the noise.
+
+**Alignment** is why slot sizes are rounded up to a multiple of 8. Memory is
+fetched in words, not bytes, so an 8-byte integer starting at offset 6 straddles
+two words and costs two fetches. The same shape appears at page scale: a record
+straddling two 4096-byte pages costs two page reads. Rounding up buys
+single-fetch access; the rounding is the padding.
+
+Go's compiler already does this to every struct:
+
+```
+badOrder    bool, int64, bool, int64    32 bytes
+goodOrder   int64, int64, bool, bool    24 bytes
+```
+
+Same four fields, 8 bytes saved by ordering them largest-first.
+
+**The cost is real and worth seeing:**
+
+```
+record  slot  pad  per page  wasted  waste %
+1       8     7    510       3570    87.2%
+8       8     0    510       0        0.0%
+13      16    3    255       765     18.7%
+16      16    0    255       0        0.0%
+17      24    7    170       1190    29.1%
+```
+
+Sizes already a multiple of 8 waste nothing. A 1-byte record padded to 8 throws
+away 87% of the page — small fixed records are where this design stops paying.
+
+**The trade:** fixed slots spend bytes to buy constant-time access; packed
+records spend time to save bytes. Rows of varying length cannot use fixed slots
+at all, which is why the heap file will need a slot directory instead.
+
+Run it: `make demo-align`, `make bench`.
+
 ### Known gaps at the end of Phase 0
 
 Deliberate, each one is a later step:
@@ -337,6 +402,7 @@ internal/
   page/             fixed-size pages, header codec, header decoder
   codec/            value encoding (compact) and key encoding (ordered)
   nullbits/         null bitmaps and SQL three-valued logic
+  slots/            fixed-size, aligned record slots inside a page
 ```
 
 ## Conventions

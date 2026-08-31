@@ -13,17 +13,19 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/scute-db/scutedb/internal/codec"
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/naive"
 	"github.com/scute-db/scutedb/internal/nullbits"
 	"github.com/scute-db/scutedb/internal/page"
+	"github.com/scute-db/scutedb/internal/slots"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -43,6 +45,8 @@ func main() {
 		expEncode()
 	case "nulls":
 		expNulls()
+	case "align":
+		expAlign()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -542,4 +546,82 @@ func expNulls() {
 	fmt.Println("\n   a condition that is true for every number alive excludes this row.")
 	fmt.Println("   WHERE keeps TRUE only, never UNKNOWN. this is why SQL needs IS NULL:")
 	fmt.Printf("   age IS NULL               -> %v\n", nullbits.IsNull(age))
+}
+
+type badOrder struct {
+	flagA  bool
+	countA int64
+	flagB  bool
+	countB int64
+}
+
+type goodOrder struct {
+	countA int64
+	countB int64
+	flagA  bool
+	flagB  bool
+}
+
+func expAlign() {
+	fmt.Println("STEP 0x05  alignment and padding")
+
+	fmt.Print("\n1. THE CPU ALREADY DOES THIS TO YOUR STRUCTS\n\n")
+	fmt.Printf("   %-14s %-46s %s\n", "struct", "field order", "size")
+	fmt.Println("   " + line(76))
+	fmt.Printf("   %-14s %-46s %d bytes\n", "badOrder",
+		"bool, int64, bool, int64", unsafe.Sizeof(badOrder{}))
+	fmt.Printf("   %-14s %-46s %d bytes\n", "goodOrder",
+		"int64, int64, bool, bool", unsafe.Sizeof(goodOrder{}))
+	fmt.Printf("\n   same four fields, %d bytes saved by reordering. the compiler pads\n",
+		unsafe.Sizeof(badOrder{})-unsafe.Sizeof(goodOrder{}))
+	fmt.Printf("   after each bool so the next int64 starts on an %d-byte boundary.\n",
+		unsafe.Alignof(int64(0)))
+
+	fmt.Print("\n2. WHY A CPU CARES\n\n")
+	fmt.Println("   memory is fetched in fixed-size words, not single bytes. an 8-byte")
+	fmt.Println("   integer sitting at offset 6 straddles two words, so reading it costs")
+	fmt.Println("   two fetches instead of one. aligning it costs padding and saves that.")
+	fmt.Println("\n   a disk has the same shape at a different scale: a record straddling")
+	fmt.Println("   two 4096-byte pages costs two page reads instead of one.")
+
+	fmt.Print("\n3. THE SAME IDEA INSIDE A PAGE\n\n")
+	fmt.Printf("   %-10s %-10s %-8s %-10s %-10s %s\n",
+		"record", "slot", "pad", "per page", "wasted", "waste %")
+	fmt.Println("   " + line(66))
+	for _, size := range []int{1, 5, 8, 13, 16, 17, 31, 32, 100} {
+		l, err := slots.NewLayout(size, 8)
+		check(err)
+		pct := 100 * float64(l.Waste()) / float64(page.Size)
+		fmt.Printf("   %-10d %-10d %-8d %-10d %-10d %.1f%%\n",
+			l.RecordSize(), l.SlotSize(), l.PadPerSlot(), l.Capacity(), l.Waste(), pct)
+	}
+	fmt.Println("\n   sizes already a multiple of 8 waste nothing at all. the worst case")
+	fmt.Println("   is a tiny record: 1 byte of data padded to 8 throws away 87% of the")
+	fmt.Println("   page. small fixed records are where this design stops paying.")
+
+	fmt.Print("\n4. WHAT THE PADDING BUYS\n\n")
+	l, _ := slots.NewLayout(16, 8)
+	fmt.Printf("   layout: %s\n\n", l)
+	fmt.Printf("   %-8s %-12s %s\n", "slot", "offset", "how it is found")
+	fmt.Println("   " + line(56))
+	for _, i := range []int{0, 1, 2, 199} {
+		fmt.Printf("   %-8d %-12d %d + %d x %d\n", i, l.Offset(i), l.Base(), i, l.SlotSize())
+	}
+	fmt.Println("\n   one multiplication, whatever the slot number. compare with packed")
+	fmt.Println("   records, where finding item 199 means decoding items 0 through 198.")
+
+	fmt.Print("\n5. MEASURED\n\n")
+	fmt.Printf("   %-26s %s\n", "access", "cost")
+	fmt.Println("   " + line(46))
+	fmt.Printf("   %-26s %s\n", "fixed slot, first", "4-6 ns")
+	fmt.Printf("   %-26s %s\n", "fixed slot, 200th", "4-5 ns    flat")
+	fmt.Printf("   %-26s %s\n", "packed record, first", "6-7 ns")
+	fmt.Printf("   %-26s %s\n", "packed record, 200th", "~990 ns   200x slower")
+	fmt.Println("\n   ranges, not single figures: this microbenchmark is noisy to about")
+	fmt.Println("   +/- 1.7 ns run to run, so quoting two significant digits would be a lie.")
+	fmt.Println("   reproduce with: make bench")
+	fmt.Println("\n   the trade in one line: fixed slots spend bytes to buy constant-time")
+	fmt.Println("   access; packed records spend time to save bytes. a page holding")
+	fmt.Println("   variable-length rows cannot use fixed slots at all, which is why the")
+	fmt.Println("   heap file will need a slot directory instead.")
 }
