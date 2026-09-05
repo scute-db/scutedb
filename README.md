@@ -377,6 +377,96 @@ at all, which is why the heap file will need a slot directory instead.
 
 Run it: `make demo-align`, `make bench`.
 
+### `0x06` B+Tree in memory
+
+`internal/btree` is the first structure that makes "find this key" fast. No disk
+yet, so the algorithm is the only thing being debugged.
+
+**Why a tree and not something simpler**, measured over 100,000 keys:
+
+```
+structure     find one key   range query   problem
+linear scan   ~60,000 ns     yes           reads everything
+hash map      5-10 ns        NO            no order at all
+B+Tree        55-60 ns       yes           -
+```
+
+Ranges across three runs. A hash map is roughly **8x faster than the B+Tree** at
+finding one key, and completely useless for `WHERE id BETWEEN 200 AND 300`. That
+single column is why databases index with trees rather than hash tables: the
+B+Tree is not the fastest way to find one key, it is the fastest way to find one
+key *while keeping the ability to walk in order*.
+
+**Internal nodes hold only separators; every value lives in a leaf.** This is
+the difference between a B-Tree and a B+Tree, and it is what will make range
+scans cheap once leaves are chained together.
+
+```
+internal [070]
+    internal [030 050]
+        leaf     [010 020]
+        leaf     [030 040]
+        leaf     [050 060]
+    internal [090 110]
+        leaf     [070 080]
+        leaf     [090 100]
+        leaf     [110 120]
+```
+
+**Splitting** happens when a node exceeds `order - 1` keys, and the two cases
+differ in a way that is easy to get wrong:
+
+- a **leaf** split *copies* its middle key upward — the key still has a value,
+  so it must stay in the leaf as well
+- an **internal** split *moves* its middle key upward — it is only a separator,
+  so keeping a copy would be duplication
+
+When the root itself splits, a new root is created above it. That is the only
+way the tree gets taller, which is why **all leaves stay at the same depth**
+automatically.
+
+**Why three levels is enough:**
+
+```
+order   level 2      level 3        level 4
+64      4,032        258,048        16,515,072
+256     65,280       16,711,680     4,278,190,080
+512     261,632      133,955,584    68,585,259,008
+```
+
+At order 512 a four-level tree addresses over 68 billion keys. Height grows like
+log(n), so multiplying the data by 500 adds **one** level. On disk each level is
+one page read, so that is 4 reads rather than 4 billion.
+
+Measured: 100,000 keys built in 18ms at order 64, height 4, any key found in
+about 55 ns. Inserting costs ~110 ns, roughly twice a lookup, which is the cost
+of shifting keys within a node.
+
+The zero value is usable: an unconfigured `Tree` reads as empty and initialises
+itself at `DefaultOrder` (64) on first write, rather than panicking.
+
+**Invariants**, checked by `Validate()` after every insert in the tests and in
+two fuzz targets:
+
+- keys sorted within every node
+- every key inside its subtree's bounds
+- all leaves at the same depth
+- `len(children) == len(keys) + 1` in internal nodes
+- no node over `order - 1` keys, no non-root node under `(order-1)/2`
+- the root is a leaf or has at least two children
+
+**The trap the tree cannot save you from:** it sorts with `bytes.Compare` and
+nothing else, so a wrong key encoding gives wrong answers silently.
+
+```
+sorted by raw bytes (codec.AppendKeyUint64):  [20 30 100 110 120]
+sorted as text:                               [100 110 120 20 30]
+```
+
+That is exactly what `0x03` was for.
+
+Run it: `make demo-btree`.
+
 ### Known gaps at the end of Phase 0
 
 Deliberate, each one is a later step:
@@ -403,6 +493,7 @@ internal/
   codec/            value encoding (compact) and key encoding (ordered)
   nullbits/         null bitmaps and SQL three-valued logic
   slots/            fixed-size, aligned record slots inside a page
+  btree/            in-memory B+Tree: search, insert, split
 ```
 
 ## Conventions

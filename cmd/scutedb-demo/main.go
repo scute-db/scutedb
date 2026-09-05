@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/scute-db/scutedb/internal/btree"
 	"github.com/scute-db/scutedb/internal/codec"
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/naive"
@@ -25,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -47,6 +49,8 @@ func main() {
 		expNulls()
 	case "align":
 		expAlign()
+	case "btree":
+		expBTree()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -610,7 +614,7 @@ func expAlign() {
 	fmt.Println("\n   one multiplication, whatever the slot number. compare with packed")
 	fmt.Println("   records, where finding item 199 means decoding items 0 through 198.")
 
-	fmt.Print("\n5. MEASURED\n\n")
+	fmt.Print("\n6. MEASURED\n\n")
 	fmt.Printf("   %-26s %s\n", "access", "cost")
 	fmt.Println("   " + line(46))
 	fmt.Printf("   %-26s %s\n", "fixed slot, first", "4-6 ns")
@@ -624,4 +628,100 @@ func expAlign() {
 	fmt.Println("   access; packed records spend time to save bytes. a page holding")
 	fmt.Println("   variable-length rows cannot use fixed slots at all, which is why the")
 	fmt.Println("   heap file will need a slot directory instead.")
+}
+
+func expBTree() {
+	fmt.Println("STEP 0x06  B+Tree in memory")
+
+	fmt.Print("\n1. WHY NOT SOMETHING SIMPLER\n\n")
+	fmt.Printf("   %-16s %-14s %-14s %s\n", "structure", "find one key", "range query", "problem")
+	fmt.Println("   " + line(74))
+	fmt.Printf("   %-16s %-14s %-14s %s\n", "linear scan", "~60,000 ns", "yes", "reads everything")
+	fmt.Printf("   %-16s %-14s %-14s %s\n", "hash map", "5-10 ns", "NO", "no order at all")
+	fmt.Printf("   %-16s %-14s %-14s %s\n", "binary tree", "O(log n)", "yes", "1 key per node")
+	fmt.Printf("   %-16s %-14s %-14s %s\n", "B+Tree", "55-60 ns", "yes", "-")
+	fmt.Println("\n   ranges across three runs, not single figures. a hash map is roughly")
+	fmt.Println("   8x faster than the B+Tree at finding one key,")
+	fmt.Println("   and completely useless for 'every id between 200 and 300'.")
+	fmt.Println("   that one column is why databases index with trees.")
+
+	fmt.Print("\n2. WATCHING A NODE SPLIT\n\n")
+	small, err := btree.New(4)
+	check(err)
+	for i := 1; i <= 4; i++ {
+		k := []byte(fmt.Sprintf("%03d", i*10))
+		small.Put(k, core.RowID{Slot: uint16(i)})
+		fmt.Printf("   after inserting %s   height %d\n", k, small.Height())
+		for _, ln := range strings.Split(strings.TrimRight(small.Dump(), "\n"), "\n") {
+			fmt.Printf("     %s\n", ln)
+		}
+	}
+	fmt.Println("   the 4th key overflowed the leaf. it split in two, and the first")
+	fmt.Println("   key of the right half was COPIED up to make a new root.")
+
+	fmt.Print("\n3. A DEEPER TREE\n\n")
+	mid, err := btree.New(4)
+	check(err)
+	for i := 1; i <= 12; i++ {
+		mid.Put([]byte(fmt.Sprintf("%03d", i*10)), core.RowID{Slot: uint16(i)})
+	}
+	for _, ln := range strings.Split(strings.TrimRight(mid.Dump(), "\n"), "\n") {
+		fmt.Printf("   %s\n", ln)
+	}
+	fmt.Printf("\n   %d keys, height %d. every leaf is the same distance from the root.\n",
+		mid.Len(), mid.Height())
+	fmt.Println("   internal nodes hold only separators; every value lives in a leaf.")
+
+	fmt.Print("\n4. THE TRAP THIS TREE CANNOT SAVE YOU FROM\n\n")
+	fmt.Println("   the tree sorts with bytes.Compare and nothing else. it has no idea")
+	fmt.Print("   a key is a number. encode 20 and 120 as TEXT and this happens:\n\n")
+	textTree, err := btree.New(8)
+	check(err)
+	for _, n := range []int{20, 100, 110, 120, 30} {
+		textTree.Put([]byte(strconv.Itoa(n)), core.RowID{Slot: uint16(n)})
+	}
+	fmt.Printf("   as text:   %s", textTree.Dump())
+	nums := []uint64{20, 100, 110, 120, 30}
+	fmt.Println("\n   the same numbers through codec.AppendKeyUint64:")
+	for _, n := range nums {
+		fmt.Printf("     %3d -> % 02X\n", n, codec.AppendKeyUint64(nil, uint64(n))[4:])
+	}
+	fmt.Printf("\n   sorted by raw bytes: %v\n",
+		sortedBy(nums, func(v uint64) []byte { return codec.AppendKeyUint64(nil, v) }))
+	fmt.Printf("   sorted as text:      %v\n",
+		sortedBy(nums, func(v uint64) []byte { return []byte(strconv.FormatUint(v, 10)) }))
+	fmt.Println("\n   this is exactly what 0x03 was for. a correct tree over a wrong key")
+	fmt.Println("   encoding gives wrong answers and never errors.")
+
+	fmt.Print("\n5. WHY THREE LEVELS IS ENOUGH\n\n")
+	fmt.Printf("   %-10s %-16s %-16s %s\n", "order", "level 2 holds", "level 3 holds", "level 4 holds")
+	fmt.Println("   " + line(66))
+	for _, order := range []int{4, 64, 256, 512} {
+		f := order
+		fmt.Printf("   %-10d %-16s %-16s %s\n", order,
+			commas(int64(f*(f-1))), commas(int64(f*f*(f-1))), commas(int64(f*f*f*(f-1))))
+	}
+	fmt.Println("\n   at order 512 a four-level tree addresses over 68 billion keys.")
+	fmt.Println("   height grows like log(n), so multiplying the data by 500 adds ONE level.")
+	fmt.Println("   on disk each level is one page read, so this is 4 reads, not 4 billion.")
+
+	fmt.Print("\n6. MEASURED\n\n")
+	big, err := btree.New(64)
+	check(err)
+	buf := make([]byte, 8)
+	start := time.Now()
+	for i := 0; i < 100000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		big.Put(buf, core.RowID{Page: core.PageID(i / 100), Slot: uint16(i % 100)})
+	}
+	built := time.Since(start)
+	fmt.Printf("   built 100,000 keys at order 64 in %s\n", built.Round(time.Millisecond))
+	fmt.Printf("   height        %d\n", big.Height())
+	fmt.Printf("   validate      %v\n", big.Validate())
+	binary.BigEndian.PutUint64(buf, 99999)
+	start = time.Now()
+	_, ok := big.Get(buf)
+	fmt.Printf("   find last key %v in %s\n", ok, time.Since(start).Round(time.Nanosecond))
+	fmt.Println("\n   4 levels means 4 node visits, whether the tree holds 100,000 keys")
+	fmt.Println("   or 68 billion. that is the whole point of the structure.")
 }

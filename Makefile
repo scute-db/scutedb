@@ -61,3 +61,6 @@ demo-nulls:
 
 demo-align:
 	go run ./cmd/scutedb-demo align
+
+demo-btree:
+	go run ./cmd/scutedb-demo btree
