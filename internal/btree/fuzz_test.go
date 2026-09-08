@@ -67,3 +67,53 @@ func FuzzGetNeverPanics(f *testing.F) {
 		_ = tr.Validate()
 	})
 }
+
+func FuzzScanMatchesBruteForce(f *testing.F) {
+	f.Add(4, []byte{1, 5, 3, 9, 2}, byte(2), byte(9))
+	f.Add(3, []byte{}, byte(0), byte(255))
+	f.Add(8, []byte{7, 7, 7}, byte(7), byte(7))
+
+	f.Fuzz(func(t *testing.T, order int, data []byte, lo, hi byte) {
+		if order < MinOrder || order > 128 || len(data) > 2048 {
+			return
+		}
+		tr, err := New(order)
+		if err != nil {
+			return
+		}
+		present := map[byte]bool{}
+		for _, b := range data {
+			tr.Put([]byte{b}, core.RowID{Slot: uint16(b)})
+			present[b] = true
+		}
+
+		var want []byte
+		for b := 0; b < 256; b++ {
+			if present[byte(b)] && byte(b) >= lo && byte(b) < hi {
+				want = append(want, byte(b))
+			}
+		}
+
+		var got []byte
+		for it := tr.Scan([]byte{lo}, []byte{hi}); it.Next(); {
+			k := it.Key()
+			if len(k) != 1 {
+				t.Fatalf("scan returned a %d-byte key", len(k))
+			}
+			got = append(got, k[0])
+		}
+
+		if len(got) != len(want) {
+			t.Fatalf("scan [%d,%d) returned %d keys, brute force %d\n got  %v\n want %v",
+				lo, hi, len(got), len(want), got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("position %d: got %d, want %d", i, got[i], want[i])
+			}
+		}
+		if err := tr.Validate(); err != nil {
+			t.Fatalf("invariants broken: %v", err)
+		}
+	})
+}

@@ -467,6 +467,77 @@ That is exactly what `0x03` was for.
 
 Run it: `make demo-btree`.
 
+### `0x07` Range scans and the iterator
+
+Leaves are now chained left to right, and `Scan(from, to)` returns a cursor that
+descends once and then walks sideways.
+
+```
+internal [070]
+    internal [030 050]
+        leaf     [010 020] ──┐
+        leaf     [030 040] ──┤  chained in order
+        leaf     [050 060] ──┘
+```
+
+**Ranges are half-open, `[from, to)`** — `from` included, `to` excluded, a `nil`
+bound unbounded. Half-open means ranges join cleanly: `[0,10)` then `[10,20)`
+covers everything once, with no gap and no overlap.
+
+**Why the chain is worth it.** Node visits for a range, at order 64 over 100,000
+keys:
+
+```
+range     Scan (chained)   Get in a loop   ratio
+10        4                40              10x
+100       7                400             57x
+1,000     35               4,000           114x
+10,000    316              40,000          127x
+```
+
+`Scan` pays for one descent and then walks; calling `Get` per key pays a full
+descent every time. Once the tree is on disk a node visit is a page read, so
+that is 316 reads against 40,000.
+
+**Lazy evaluation** is the other half. Rows are produced one at a time, so work
+not asked for is never done:
+
+```
+first 10        (10 rows)       200ns
+first 1,000     (1,000 rows)    7.4µs
+first 100,000   (100,000 rows)  758.8µs
+```
+
+Ten rows out of a hundred thousand costs almost nothing, because the other
+99,990 are never touched. That is what `LIMIT` rides on.
+
+**Streaming rather than materialising:**
+
+```
+                          time      memory
+streaming (iterator)      521µs     80 bytes, 1 allocation
+collecting into a slice   8.4ms     18.5 MB, 100,030 allocations
+```
+
+Both walk the same 100,000 rows. The iterator holds a position, not the rows —
+which is why a database can return a billion-row result to a client that only
+wants the first page.
+
+**Why a B+Tree beats a B-Tree here.** A B-Tree keeps values in internal nodes
+too, so an in-order scan has to climb between levels and its reads land all over
+the file. A B+Tree keeps every value in a leaf and chains the leaves, so a scan
+touches one level, in order — turning random reads into sequential ones.
+
+**A new invariant.** `Validate()` now checks the leaf chain visits every leaf
+exactly once, in tree order, and terminates. A split that forgets to link
+produces a scan that silently returns partial results, so there is a negative
+test proving `Validate` rejects both a broken chain and a cyclic one.
+
+`Scan` is verified against a brute-force filter over 300 random ranges, and by a
+fuzz target that ran 2.9M cases comparing scan output to the same brute force.
+
+Run it: `make demo-range`.
+
 ### Known gaps at the end of Phase 0
 
 Deliberate, each one is a later step:
@@ -493,7 +564,7 @@ internal/
   codec/            value encoding (compact) and key encoding (ordered)
   nullbits/         null bitmaps and SQL three-valued logic
   slots/            fixed-size, aligned record slots inside a page
-  btree/            in-memory B+Tree: search, insert, split
+  btree/            in-memory B+Tree: search, insert, split, range scans
 ```
 
 ## Conventions

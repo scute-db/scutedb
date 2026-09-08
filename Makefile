@@ -64,3 +64,6 @@ demo-align:
 
 demo-btree:
 	go run ./cmd/scutedb-demo btree
+
+demo-range:
+	go run ./cmd/scutedb-demo range
