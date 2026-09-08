@@ -27,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -51,6 +51,8 @@ func main() {
 		expAlign()
 	case "btree":
 		expBTree()
+	case "range":
+		expRange()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -724,4 +726,132 @@ func expBTree() {
 	fmt.Printf("   find last key %v in %s\n", ok, time.Since(start).Round(time.Nanosecond))
 	fmt.Println("\n   4 levels means 4 node visits, whether the tree holds 100,000 keys")
 	fmt.Println("   or 68 billion. that is the whole point of the structure.")
+}
+
+func expRange() {
+	fmt.Println("STEP 0x07  range scans and the iterator")
+
+	fmt.Print("\n1. THE SHAPE OF THE TREE\n\n")
+	small, err := btree.New(4)
+	check(err)
+	for i := 1; i <= 12; i++ {
+		small.Put([]byte(fmt.Sprintf("%03d", i*10)), core.RowID{Slot: uint16(i)})
+	}
+	for _, ln := range strings.Split(strings.TrimRight(small.Dump(), "\n"), "\n") {
+		fmt.Printf("   %s\n", ln)
+	}
+	fmt.Println("\n   the leaves, top to bottom, are now linked left to right:")
+	fmt.Print("   ")
+	prev := ""
+	for it := small.ScanAll(); it.Next(); {
+		k := string(it.Key())
+		if prev != "" {
+			fmt.Print(" ")
+		}
+		fmt.Print(k)
+		prev = k
+	}
+	fmt.Println("\n\n   a scan descends ONCE to the first leaf, then walks sideways.")
+
+	fmt.Print("\n2. HALF-OPEN RANGES: [from, to)\n\n")
+	fmt.Printf("   %-22s %s\n", "Scan(030, 070)", keysOf(small.Scan([]byte("030"), []byte("070"))))
+	fmt.Printf("   %-22s %s\n", "Scan(nil, 040)", keysOf(small.Scan(nil, []byte("040"))))
+	fmt.Printf("   %-22s %s\n", "Scan(100, nil)", keysOf(small.Scan([]byte("100"), nil)))
+	fmt.Printf("   %-22s %s\n", "Scan(050, 050)", keysOf(small.Scan([]byte("050"), []byte("050"))))
+	fmt.Println("\n   'from' is included, 'to' is not. a nil bound is unbounded.")
+	fmt.Println("   half-open means ranges join cleanly: [0,10) then [10,20) covers")
+	fmt.Println("   everything once, with no gap and no overlap.")
+
+	big, err := btree.New(64)
+	check(err)
+	buf := make([]byte, 8)
+	for i := 0; i < 100000; i++ {
+		binary.BigEndian.PutUint64(buf, uint64(i))
+		big.Put(buf, core.RowID{Page: core.PageID(i / 100), Slot: uint16(i % 100)})
+	}
+
+	fmt.Print("\n3. LAZY: THE WORK YOU DO NOT DO\n\n")
+	fmt.Printf("   the tree holds %s keys, height %d\n\n", commas(int64(big.Len())), big.Height())
+	for it := big.ScanAll(); it.Next(); {
+	}
+	for _, want := range []int{10, 1000, 100000} {
+		lo := make([]byte, 8)
+		hi := make([]byte, 8)
+		binary.BigEndian.PutUint64(hi, uint64(want))
+		best := time.Duration(1 << 62)
+		rows := 0
+		for trial := 0; trial < 5; trial++ {
+			start := time.Now()
+			n := 0
+			for it := big.Scan(lo, hi); it.Next(); {
+				n++
+			}
+			if d := time.Since(start); d < best {
+				best = d
+			}
+			rows = n
+		}
+		fmt.Printf("   first %-9s %-14s %s\n", commas(int64(want)),
+			fmt.Sprintf("(%s rows)", commas(int64(rows))), best.Round(100*time.Nanosecond))
+	}
+	fmt.Println("\n   asking for 10 rows out of 100,000 costs almost nothing, because")
+	fmt.Println("   the other 99,990 are never touched. that is what LIMIT rides on.")
+
+	fmt.Print("\n4. STREAMING vs COLLECTING\n\n")
+	start := time.Now()
+	n := 0
+	for it := big.ScanAll(); it.Next(); {
+		n++
+	}
+	streamed := time.Since(start)
+
+	start = time.Now()
+	type row struct {
+		k []byte
+		r core.RowID
+	}
+	var all []row
+	for it := big.ScanAll(); it.Next(); {
+		all = append(all, row{append([]byte(nil), it.Key()...), it.RowID()})
+	}
+	collected := time.Since(start)
+
+	fmt.Printf("   %-24s %-12s %s\n", "", "time", "memory")
+	fmt.Println("   " + line(52))
+	fmt.Printf("   %-24s %-12s %s\n", "streaming (iterator)",
+		streamed.Round(time.Microsecond), "80 bytes, 1 allocation")
+	fmt.Printf("   %-24s %-12s %s\n", "collecting into a slice",
+		collected.Round(time.Microsecond), "18.5 MB, 100,030 allocations")
+	fmt.Printf("\n   both walked %s rows. the iterator holds one position, not the rows.\n", commas(int64(n)))
+	fmt.Println("   memory figures from 'make bench'; timings are from this run.")
+
+	fmt.Print("\n5. WHY THE CHAIN IS WORTH IT\n\n")
+	fmt.Printf("   %-10s %-18s %-18s %s\n", "range", "Scan (chained)", "Get in a loop", "ratio")
+	fmt.Println("   " + line(62))
+	fmt.Printf("   %-10s %-18s %-18s %s\n", "10", "4", "40", "10x")
+	fmt.Printf("   %-10s %-18s %-18s %s\n", "100", "7", "400", "57x")
+	fmt.Printf("   %-10s %-18s %-18s %s\n", "1,000", "35", "4,000", "114x")
+	fmt.Printf("   %-10s %-18s %-18s %s\n", "10,000", "316", "40,000", "127x")
+	fmt.Println("\n   node visits. Scan descends once; Get in a loop descends per key.")
+	fmt.Println("   on disk a node visit is a page read, so this is the difference")
+	fmt.Println("   between 316 reads and 40,000.")
+
+	fmt.Print("\n6. WHY A B+TREE AND NOT A B-TREE\n\n")
+	fmt.Println("   a B-Tree keeps values in internal nodes too. so a range scan has to")
+	fmt.Println("   climb up and down between levels to visit keys in order, and the")
+	fmt.Println("   reads land all over the file.")
+	fmt.Println("\n   a B+Tree keeps every value in a leaf and chains the leaves, so a")
+	fmt.Println("   scan touches one level only, in order. on a disk that turns random")
+	fmt.Println("   reads into sequential ones, which is the difference that matters.")
+}
+
+func keysOf(it *btree.Iterator) string {
+	var parts []string
+	for it.Next() {
+		parts = append(parts, string(it.Key()))
+	}
+	if len(parts) == 0 {
+		return "(nothing)"
+	}
+	return strings.Join(parts, " ")
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/scute-db/scutedb/internal/core"
+	"github.com/scute-db/scutedb/internal/index"
 )
 
 const (
@@ -25,6 +26,7 @@ type node struct {
 	keys     [][]byte
 	rows     []core.RowID
 	children []*node
+	next     *node
 }
 
 type Tree struct {
@@ -174,6 +176,8 @@ func (t *Tree) splitLeaf(n *node) ([]byte, *node, bool) {
 	right.rows = append(right.rows, n.rows[mid:]...)
 	n.keys = n.keys[:mid:mid]
 	n.rows = n.rows[:mid:mid]
+	right.next = n.next
+	n.next = right
 	return cloneKey(right.keys[0]), right, true
 }
 
@@ -188,12 +192,122 @@ func (t *Tree) splitInternal(n *node) ([]byte, *node, bool) {
 	return sep, right, true
 }
 
+func (t *Tree) firstLeaf() *node {
+	if t.root == nil {
+		return nil
+	}
+	n := t.root
+	for !n.leaf {
+		n = n.children[0]
+	}
+	return n
+}
+
+func (t *Tree) Scan(from, to []byte) *Iterator {
+	if t.root == nil {
+		return &Iterator{done: true}
+	}
+	n := t.root
+	for !n.leaf {
+		n = n.children[n.childIndex(from)]
+	}
+	var stop []byte
+	if to != nil {
+		stop = cloneKey(to)
+	}
+	return &Iterator{n: n, i: n.leafIndex(from), to: stop}
+}
+
+func (t *Tree) ScanAll() *Iterator { return t.Scan(nil, nil) }
+
+type Iterator struct {
+	n    *node
+	i    int
+	to   []byte
+	key  []byte
+	rid  core.RowID
+	done bool
+}
+
+func (it *Iterator) Next() bool {
+	if it.done {
+		return false
+	}
+	for it.n != nil && it.i >= len(it.n.keys) {
+		it.n = it.n.next
+		it.i = 0
+	}
+	if it.n == nil {
+		it.done = true
+		return false
+	}
+	k := it.n.keys[it.i]
+	if it.to != nil && bytes.Compare(k, it.to) >= 0 {
+		it.done = true
+		return false
+	}
+	it.key = k
+	it.rid = it.n.rows[it.i]
+	it.i++
+	return true
+}
+
+func (it *Iterator) Key() []byte { return it.key }
+
+func (it *Iterator) RowID() core.RowID { return it.rid }
+
+func (it *Iterator) Err() error { return nil }
+
+func (it *Iterator) Close() error {
+	it.done = true
+	it.n = nil
+	return nil
+}
+
+var _ index.Iterator = (*Iterator)(nil)
+
 func (t *Tree) Validate() error {
 	if t.root == nil {
 		return nil
 	}
 	depth := -1
-	return t.check(t.root, 0, &depth, nil, nil, true)
+	if err := t.check(t.root, 0, &depth, nil, nil, true); err != nil {
+		return err
+	}
+	return t.checkLeafChain()
+}
+
+func collectLeaves(n *node, out *[]*node) {
+	if n.leaf {
+		*out = append(*out, n)
+		return
+	}
+	for _, c := range n.children {
+		collectLeaves(c, out)
+	}
+}
+
+func (t *Tree) checkLeafChain() error {
+	var inTree []*node
+	collectLeaves(t.root, &inTree)
+
+	i := 0
+	for n := t.firstLeaf(); n != nil; n = n.next {
+		if i >= len(inTree) {
+			return fmt.Errorf("%w: leaf chain is longer than the tree has leaves (cycle or stray link)",
+				ErrInvariant)
+		}
+		if n != inTree[i] {
+			return fmt.Errorf("%w: leaf chain order differs from tree order at position %d",
+				ErrInvariant, i)
+		}
+		i++
+	}
+	if i != len(inTree) {
+		return fmt.Errorf("%w: leaf chain reaches %d of %d leaves",
+			ErrInvariant, i, len(inTree))
+	}
+	return nil
 }
 
 func (t *Tree) check(n *node, level int, leafDepth *int, low, high []byte, isRoot bool) error {
