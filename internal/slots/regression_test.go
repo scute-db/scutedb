@@ -2,6 +2,7 @@ package slots
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/scute-db/scutedb/internal/page"
@@ -9,8 +10,12 @@ import (
 
 func TestNegativeOrZeroRecordSizeIsRejected(t *testing.T) {
 	for _, size := range []int{-5, -1, 0, page.Size + 1} {
-		if _, err := NewLayout(size, 8); !errors.Is(err, ErrNoFit) {
+		_, err := NewLayout(size, 8)
+		if !errors.Is(err, ErrNoFit) {
 			t.Fatalf("NewLayout(%d, 8) gave %v, want ErrNoFit", size, err)
+		}
+		if !strings.Contains(err.Error(), "record size") {
+			t.Fatalf("NewLayout(%d, 8) reported %q; the explicit size guard should name the record size, not derive a nonsense slot size", size, err)
 		}
 	}
 }

@@ -27,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range|delete")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -53,6 +53,8 @@ func main() {
 		expBTree()
 	case "range":
 		expRange()
+	case "delete":
+		expDelete()
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
@@ -854,4 +856,162 @@ func keysOf(it *btree.Iterator) string {
 		return "(nothing)"
 	}
 	return strings.Join(parts, " ")
+}
+
+func expDelete() {
+	fmt.Println("STEP 0x08  B+Tree deletion")
+
+	fmt.Print("\n1. THE PROBLEM: UNDERFLOW\n\n")
+	fmt.Println("   inserting can only ever make a node TOO FULL, and there is one")
+	fmt.Println("   answer: split it. deleting makes a node TOO EMPTY, and there are")
+	fmt.Println("   three answers, which is why this step is the hard one.")
+	fmt.Println("\n   at order 4 a node may hold 3 keys and must hold at least 1.")
+	fmt.Println("   drop below that minimum and the node has UNDERFLOWED.")
+
+	fmt.Print("\n2. THE THREE FIXES, AS THEY ACTUALLY HAPPEN\n\n")
+	tr, err := btree.New(4)
+	check(err)
+	for i := 1; i <= 8; i++ {
+		tr.Put([]byte(fmt.Sprintf("%03d", i*10)), core.RowID{Slot: uint16(i)})
+	}
+	fmt.Print("   order 4: a node holds at most 3 keys and at least 1.\n\n")
+	dumpIndented(tr, "     ")
+	for _, k := range []string{"030", "040", "010", "020", "050", "060", "070"} {
+		deleteAndReport(tr, k)
+	}
+	s := tr.Stats()
+	fmt.Printf("\n   totals: %d borrows left, %d borrows right, %d merges, %d collapses\n",
+		s.BorrowsLeft, s.BorrowsRight, s.Merges, s.Collapses)
+	fmt.Println("\n   borrowing rewrites one separator. merging deletes one, which is")
+	fmt.Println("   what can make the parent underflow in turn.")
+
+	fmt.Print("\n3. THE CASCADE\n\n")
+	fmt.Println("   merging two children removes a key from their parent, which can")
+	fmt.Println("   make the PARENT underflow, which repeats all the way to the root.")
+	tr3, err := btree.New(4)
+	check(err)
+	for i := 0; i < 2000; i++ {
+		tr3.Put(key8(i), core.RowID{Slot: uint16(i % 1000)})
+	}
+	tall := tr3.Height()
+	for i := 0; i < 1990; i++ {
+		tr3.Delete(key8(i))
+	}
+	s3 := tr3.Stats()
+	fmt.Printf("\n   2000 keys      -> height %d\n", tall)
+	fmt.Printf("   delete 1990    -> height %d\n", tr3.Height())
+	fmt.Printf("   along the way: %d borrows, %d merges, %d root collapses\n",
+		s3.BorrowsLeft+s3.BorrowsRight, s3.Merges, s3.Collapses)
+	fmt.Println("\n   the tree grew from the root and it shrinks back to the root.")
+
+	fmt.Print("\n4. WHY DELETION IS THE HARD ONE\n\n")
+	fmt.Printf("   %-28s %s\n", "insert", "delete")
+	fmt.Println("   " + line(60))
+	fmt.Printf("   %-28s %s\n", "does it fit? done", "still enough keys? done")
+	fmt.Printf("   %-28s %s\n", "too full -> split", "too empty -> borrow from left")
+	fmt.Printf("   %-28s %s\n", "", "           or borrow from right")
+	fmt.Printf("   %-28s %s\n", "", "           or merge")
+	fmt.Printf("   %-28s %s\n", "", "and the merge may cascade up")
+	fmt.Printf("   %-28s %s\n", "", "and the root may collapse")
+	fmt.Println("\n   two cases against six. and every one of the six behaves")
+	fmt.Println("   differently for a leaf than for an internal node.")
+
+	fmt.Print("\n5. GHOST SEPARATORS\n\n")
+	fmt.Println("   a separator only has to POINT the search the right way. it does")
+	fmt.Println("   not have to be a key that exists.")
+	tr4, err := btree.New(4)
+	check(err)
+	for i := 0; i < 100; i++ {
+		tr4.Put(key8(i), core.RowID{Slot: uint16(i)})
+	}
+	seps := tr4.Separators()
+	for _, k := range seps {
+		tr4.Delete(k)
+	}
+	after := tr4.Separators()
+	ghosts := 0
+	for _, k := range after {
+		if _, ok := tr4.Get(k); !ok {
+			ghosts++
+		}
+	}
+	wrong := 0
+	for i := 0; i < 100; i++ {
+		k := key8(i)
+		wasSep := false
+		for _, sp := range seps {
+			if bytes.Equal(sp, k) {
+				wasSep = true
+			}
+		}
+		if _, ok := tr4.Get(k); ok == wasSep {
+			wrong++
+		}
+	}
+	fmt.Printf("\n   deleted all %d keys that appeared as separators.\n", len(seps))
+	fmt.Printf("   %d of the %d separators left in the tree now name keys that are gone.\n",
+		ghosts, len(after))
+	fmt.Printf("   lookups that return the wrong answer: %d of 100\n", wrong)
+	fmt.Printf("   validate: %v\n", tr4.Validate())
+	fmt.Println("\n   so deletion never has to hunt down and repair separators above it.")
+	fmt.Println("   that is a large amount of work the algorithm gets to skip.")
+
+	fmt.Print("\n6. WHY SOME ENGINES NEVER MERGE AT ALL\n\n")
+	tr5, err := btree.New(16)
+	check(err)
+	for i := 0; i < 4000; i++ {
+		tr5.Put(key8(i), core.RowID{Slot: uint16(i % 1000)})
+	}
+	l1, k1, c1 := tr5.LeafFill()
+	for i := 0; i < 4000; i += 2 {
+		tr5.Delete(key8(i))
+	}
+	l2, k2, c2 := tr5.LeafFill()
+	fmt.Printf("   %-26s %-10s %-10s %s\n", "", "leaves", "keys", "fill")
+	fmt.Println("   " + line(56))
+	fmt.Printf("   %-26s %-10d %-10d %.0f%%\n", "4000 keys", l1, k1, 100*float64(k1)/float64(c1))
+	fmt.Printf("   %-26s %-10d %-10d %.0f%%\n", "after deleting half", l2, k2, 100*float64(k2)/float64(c2))
+	fmt.Printf("\n   merging kept the leaves reasonably full and gave %d of them back.\n", l1-l2)
+	fmt.Println("   without merging, the leaf count would have stayed at", l1, "and the")
+	fmt.Println("   fill would have halved — the index gets bigger than the data.")
+	fmt.Println("\n   and yet: Postgres's B-Tree does NOT merge partially-empty pages.")
+	fmt.Println("   it only reclaims pages that are entirely empty. that is exactly why")
+	fmt.Println("   index bloat is a real operational problem there, and why REINDEX")
+	fmt.Println("   exists. merging costs write amplification and page locks on a hot")
+	fmt.Println("   path, and some engines decide that trade is not worth it.")
+}
+
+func deleteAndReport(tr *btree.Tree, k string) {
+	before := tr.Stats()
+	if !tr.Delete([]byte(k)) {
+		fmt.Printf("\n   delete %s -> not present\n", k)
+		return
+	}
+	a := tr.Stats()
+	what := "fitted, no repair needed"
+	switch {
+	case a.Merges > before.Merges:
+		what = "MERGED two nodes into one"
+	case a.BorrowsLeft > before.BorrowsLeft:
+		what = "BORROWED from the LEFT sibling"
+	case a.BorrowsRight > before.BorrowsRight:
+		what = "BORROWED from the RIGHT sibling"
+	}
+	if a.Collapses > before.Collapses {
+		what += ", then the ROOT COLLAPSED"
+	}
+	fmt.Printf("\n   delete %s -> %s\n", k, what)
+	dumpIndented(tr, "     ")
+}
+
+func dumpIndented(tr *btree.Tree, pad string) {
+	for _, ln := range strings.Split(strings.TrimRight(tr.Dump(), "\n"), "\n") {
+		fmt.Printf("%s%s\n", pad, ln)
+	}
+}
+
+func key8(n int) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(n))
+	return b
 }
