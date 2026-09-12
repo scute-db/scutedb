@@ -6,7 +6,9 @@ A *scute* is one of the bony plates that make up a turtle's shell. A shell is
 made of plates; a database file is made of pages. 
 
 
-**Status:** Phase 0 complete more to go a lot of learning and doing.
+**Status:** Phases 0 and A complete. The B+Tree searches, inserts, splits,
+scans ranges and deletes. All of it still lives in memory — Phase B puts it on
+disk.
 
 ---
 
@@ -17,6 +19,7 @@ go test ./...              # everything
 make demo                  # list the runnable experiments
 make demo-scan             # watch a file-based database degrade
 make hexdump               # write real pages and look at the bytes
+make demo-delete           # borrow, merge and root collapse, traced live
 ```
 
 ---
@@ -26,8 +29,8 @@ make hexdump               # write real pages and look at the bytes
 | Phase | What | Status |
 |-------|------|--------|
 | **0** | Foundations — interfaces, the naive database, pages | **done** |
-| A | Bytes & the B+Tree | **in progress** |
-| B | Persistence — storage manager, buffer pool, locking | |
+| **A** | Bytes & the B+Tree | **done** |
+| B | Persistence — storage manager, buffer pool, locking | **next** |
 | C | A real data store — schema, rows, indexes | |
 | D | Transactions — WAL, recovery, 2PL, MVCC | |
 | E | Beyond — LSM engine, Raft, server, query planner | |
@@ -629,11 +632,28 @@ executions, each up to 3,000 operations, validating after each one.
 
 Run it: `make demo-delete`.
 
-### Known gaps at the end of Phase 0
+### Phase A in one paragraph
+
+Six steps turned raw bytes into a working index. `codec` ships two encodings
+because keys and values have different jobs — values optimise for size, keys
+optimise for sorting correctly as raw bytes, and conflating them is not
+recoverable later. `nullbits` makes "no value" a property of the row rather than
+a magic value hidden inside it, and carries the three-valued logic that follows
+from that. `slots` buys O(1) addressing inside a page for a few bytes of padding.
+`btree` turns a linear scan into three or four hops, keeps the leaves chained so
+a range costs one descent and then a sideways walk, and now repairs itself when
+deletes empty a node out.
+
+What is still missing is the part that makes this a database rather than a data
+structure: none of it survives a restart. Every node is a Go pointer. Phase B
+replaces those pointers with page IDs, and the tree starts living on disk.
+
+### Known gaps at the end of Phase A
 
 Deliberate, each one is a later step:
 
 - ~~`Page.Append` writes items with no separator~~ → fixed in `0x03`
+- The B+Tree is pointers in memory and nothing persists → `0x09` (nodes become pages)
 - No way to find item *n* without walking items 1..*n-1* → `0x0F` (slot directory)
 - `File.Allocate` never reuses a freed page → `0x0A` (free list)
 - The reserved header bytes hold no checksum → `0x13`
