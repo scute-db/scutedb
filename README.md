@@ -21,7 +21,7 @@ make hexdump               # write real pages and look at the bytes
 
 ---
 
-## Roadmap
+## Roadmap I am trying to follow plan first execute second
 
 | Phase | What | Status |
 |-------|------|--------|
@@ -538,6 +538,97 @@ fuzz target that ran 2.9M cases comparing scan output to the same brute force.
 
 Run it: `make demo-range`.
 
+### `0x08` B+Tree deletion
+
+The step most from-scratch databases stop at. Insert has one failure mode and
+one answer; delete has one failure mode and **three**, any of which can cascade.
+
+```
+insert                     delete
+does it fit? done          still enough keys? done
+too full -> split          too empty -> borrow from left
+                                     or borrow from right
+                                     or merge
+                           and the merge may cascade up
+                           and the root may collapse
+```
+
+Every one of those six behaves differently for a leaf than for an internal node,
+which is where the "3x harder" comes from.
+
+**All four repair paths in one trace** at order 4 (max 3 keys, min 1) — the demo
+reports what actually happened rather than what was expected:
+
+```
+delete 030 -> fitted, no repair needed
+delete 040 -> BORROWED from the LEFT sibling
+delete 010 -> MERGED two nodes into one
+delete 020 -> BORROWED from the RIGHT sibling
+delete 050 -> MERGED two nodes into one
+delete 060 -> BORROWED from the RIGHT sibling
+delete 070 -> MERGED two nodes into one, then the ROOT COLLAPSED
+```
+
+**Borrowing rewrites one separator. Merging deletes one** — which is what can
+make the parent underflow in turn, and so on up. The tree grew from the root and
+it shrinks back to the root:
+
+```
+2000 keys      -> height 7
+delete 1990    -> height 3
+along the way: 1487 borrows, 1485 merges, 4 root collapses
+```
+
+**The leaf/internal asymmetry mirrors the split asymmetry exactly.** A leaf
+*split* copies its middle key up; an internal split *moves* it. A leaf *merge*
+discards the separator; an internal merge *pulls it down* between the two halves,
+because for an internal node that separator is the only copy of the key.
+
+**Ghost separators.** A separator only has to point a search the right way — it
+does **not** have to name a key that exists. Deleting every key that appears as a
+separator, then re-checking:
+
+```
+deleted all 49 keys that appeared as separators
+49 of the 49 separators left now name keys that are gone
+lookups that return the wrong answer: 0 of 100
+validate: <nil>
+```
+
+This is why deletion never has to hunt upward and repair separators — a large
+amount of work the algorithm gets to skip, and the reason a stale separator is
+correct rather than a bug.
+
+**Why some engines never merge at all.** Merging keeps the index dense:
+
+```
+                     leaves   keys   fill
+4000 keys            500      4000   53%
+after deleting half  249      2000   54%
+```
+
+251 leaves handed back, fill unchanged. Without merging the leaf count would
+have stayed at 500 and the fill halved — the index growing while the data
+shrinks. And yet **Postgres's B-Tree does not merge partially-empty pages**; it
+only reclaims entirely empty ones. That is exactly why index bloat is an
+operational concern there and why `REINDEX` exists. Merging costs write
+amplification and page locks on a hot path, and some engines judge that trade
+not worth making.
+
+**`index.Index` is now satisfied.** With `Delete` in place, `btree.Index` wraps
+the tree to match the interface written in `0x00` — asserted by
+`var _ index.Index = (*Index)(nil)`. The natural API stays natural (`Get`
+returns a bool, `Put` cannot fail in memory); the adapter translates.
+
+**How it is verified.** A reference `map` is maintained alongside the tree
+through 4,000 random insert/delete operations at five orders, with `Validate()`
+after **every** operation and an exhaustive `Get` check over the whole key space
+at the end. `TestMinKeysHoldsForEveryOrder` inserts 400 and deletes 400 for
+every order from 3 to 40. `FuzzInsertDeleteAgainstReference` ran 344,719
+executions, each up to 3,000 operations, validating after each one.
+
+Run it: `make demo-delete`.
+
 ### Known gaps at the end of Phase 0
 
 Deliberate, each one is a later step:
@@ -564,7 +655,7 @@ internal/
   codec/            value encoding (compact) and key encoding (ordered)
   nullbits/         null bitmaps and SQL three-valued logic
   slots/            fixed-size, aligned record slots inside a page
-  btree/            in-memory B+Tree: search, insert, split, range scans
+  btree/            in-memory B+Tree: search, insert, split, range scans, delete
 ```
 
 ## Conventions

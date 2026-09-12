@@ -117,3 +117,64 @@ func FuzzScanMatchesBruteForce(f *testing.F) {
 		}
 	})
 }
+
+func FuzzInsertDeleteAgainstReference(f *testing.F) {
+	f.Add(4, []byte{1, 2, 3, 0x81, 0x82})
+	f.Add(3, []byte{5, 5, 0x85, 0x85})
+	f.Add(5, []byte{0x80, 0x81, 0x82})
+	f.Add(64, []byte{})
+
+	f.Fuzz(func(t *testing.T, order int, ops []byte) {
+		if order < MinOrder || order > 128 || len(ops) > 3000 {
+			return
+		}
+		tr, err := New(order)
+		if err != nil {
+			return
+		}
+		want := map[byte]bool{}
+
+		for _, op := range ops {
+			k := op & 0x7F
+			if op&0x80 != 0 {
+				gotOK := tr.Delete([]byte{k})
+				if gotOK != want[k] {
+					t.Fatalf("Delete(%d) = %v, reference says %v", k, gotOK, want[k])
+				}
+				delete(want, k)
+			} else {
+				tr.Put([]byte{k}, core.RowID{Slot: uint16(k)})
+				want[k] = true
+			}
+			if err := tr.Validate(); err != nil {
+				t.Fatalf("after op %02X: %v", op, err)
+			}
+			if tr.Len() != len(want) {
+				t.Fatalf("after op %02X: Len = %d, reference has %d", op, tr.Len(), len(want))
+			}
+		}
+
+		var seen []byte
+		for it := tr.ScanAll(); it.Next(); {
+			seen = append(seen, it.Key()[0])
+		}
+		if len(seen) != len(want) {
+			t.Fatalf("scan returned %d keys, reference has %d", len(seen), len(want))
+		}
+		for i := 1; i < len(seen); i++ {
+			if seen[i-1] >= seen[i] {
+				t.Fatalf("scan not sorted at %d", i)
+			}
+		}
+		for _, k := range seen {
+			if !want[k] {
+				t.Fatalf("scan returned %d which is not in the reference", k)
+			}
+		}
+		for k := byte(0); k < 128; k++ {
+			if _, ok := tr.Get([]byte{k}); ok != want[k] {
+				t.Fatalf("Get(%d) = %v, reference says %v", k, ok, want[k])
+			}
+		}
+	})
+}

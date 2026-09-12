@@ -67,3 +67,6 @@ demo-btree:
 
 demo-range:
 	go run ./cmd/scutedb-demo range
+
+demo-delete:
+	go run ./cmd/scutedb-demo delete

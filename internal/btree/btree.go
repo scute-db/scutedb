@@ -35,6 +35,7 @@ type Tree struct {
 	maxKeys int
 	minKeys int
 	count   int
+	stats   Stats
 }
 
 func New(order int) (*Tree, error) {
