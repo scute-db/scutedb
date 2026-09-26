@@ -6,9 +6,9 @@ A *scute* is one of the bony plates that make up a turtle's shell. A shell is
 made of plates; a database file is made of pages. 
 
 
-**Status:** Phases 0 and A complete. The B+Tree searches, inserts, splits,
-scans ranges and deletes. All of it still lives in memory — Phase B puts it on
-disk.
+**Status:** Phases 0 and A complete. Phase B has started: a B+Tree node now has
+a byte-for-byte on-disk format, and a tree can be walked straight out of a file
+using nothing but page numbers.
 
 ---
 
@@ -20,6 +20,7 @@ make demo                  # list the runnable experiments
 make demo-scan             # watch a file-based database degrade
 make hexdump               # write real pages and look at the bytes
 make demo-delete           # borrow, merge and root collapse, traced live
+make demo-nodepage         # decode a real B+Tree page out of a real file
 ```
 
 ---
@@ -30,7 +31,7 @@ make demo-delete           # borrow, merge and root collapse, traced live
 |-------|------|--------|
 | **0** | Foundations — interfaces, the naive database, pages | **done** |
 | **A** | Bytes & the B+Tree | **done** |
-| B | Persistence — storage manager, buffer pool, locking | **next** |
+| B | Persistence — storage manager, buffer pool, locking | **in progress** |
 | C | A real data store — schema, rows, indexes | |
 | D | Transactions — WAL, recovery, 2PL, MVCC | |
 | E | Beyond — LSM engine, Raft, server, query planner | |
@@ -661,6 +662,146 @@ Deliberate, each one is a later step:
 
 ---
 
+## Phase B — Persistence
+
+### `0x09` Nodes as pages
+
+Every node in `0x06` to `0x08` was a Go struct held together by pointers. A
+pointer is a RAM address: it is meaningless in the next process, so the entire
+tree evaporates on exit. This step gives a node a byte layout and swaps every
+pointer for a **page number**.
+
+```
+in memory                          on disk
+children []*node   8 bytes each    child core.PageID   4 bytes each
+                   a RAM address                       a page number
+                   valid until exit                    valid forever
+```
+
+Page 12 is at byte `12 * 4096 = 49152` — in this process, in the next one, and on
+another machine. That single swap is the whole step; everything below follows
+from it.
+
+**The layout.** `internal/nodepage` is a *slotted page*, the same shape Postgres
+and SQLite use:
+
+```
+region         bytes         holds
+page header    0..15         id, kind, key count, free start, free end
+node header    16..23        next leaf / first child, level, 2 pad
+slot array     24..          4 bytes per entry, in KEY order
+free space                   shrinks from both ends
+cells          ..4095        key + payload, in INSERTION order
+```
+
+Slots grow up from byte 24, cells grow down from byte 4095, and free space is
+whatever is left between them. The trick worth noticing: **the slot array is
+sorted, the cells are not.** A slot is 4 bytes (`offset`, `length`) and inserting
+a key in the middle means shifting a few 4-byte slots, never the key bytes
+themselves. Binary search reads the slot array, so lookups stay `O(log n)` while
+writes stay cheap.
+
+**Two cell shapes**, and the key length never needs storing because the suffix is
+fixed:
+
+```
+leaf cell      key bytes || row page (4) || row slot (2)      key = len - 6
+internal cell  key bytes || child page  (4)                   key = len - 4
+```
+
+An internal node with *n* keys has *n+1* children. The extra child has no slot to
+live in, so it lives in the node header — that is what `first child` is.
+
+**Fanout is computed, not chosen.** With a 4096-byte page and an 8-byte key:
+
+```
+  page header        16
+  node header         8
+  left for entries 4072
+
+  internal entry = 4 slot + 8 key + 4 child  = 16 bytes -> 254 keys, 255 children
+  leaf entry     = 4 slot + 8 key + 6 row id = 18 bytes -> 226 keys
+
+  levels   reads per get  keys it holds
+  1        1              226
+  2        2              57,630
+  3        3              14,695,650
+  4        4              3,747,390,750
+```
+
+This corrects a number stated earlier in this file. `0x06` estimated ~340 keys
+per internal node from `4080 / (8 + 4)`, which quietly ignored the node header
+and the 4-byte slot every entry needs. The real figure is **254** — the
+bookkeeping costs 25% of the fanout. The estimate was optimistic in the usual
+direction: it counted the data and forgot the structure that makes the data
+findable.
+
+**A real page, out of a real file.** Three pages written to disk, then read back
+with `xxd` — no ScuteDB code involved in the reading:
+
+```
+$ xxd -s 4096 -l 32 tree.db
+00001000: 0000 0001 0300 0002 0020 0fe4 0000 0000  ......... ......
+00001010: 0000 0002 0000 0000 0ff2 000e 0fe4 000e  ................
+```
+
+Decoding it by hand, left to right:
+
+| bytes | value | meaning |
+|---|---|---|
+| `0000 0001` | 1 | page id |
+| `03` | 3 | kind, `btree-leaf` |
+| `00` | 0 | flags |
+| `0002` | 2 | key count |
+| `0020` | 32 | free start, `24 + 2 slots x 4` |
+| `0fe4` | 4068 | free end, where the lowest cell begins |
+| `0000 0000` | — | reserved for the checksum in `0x13` |
+| `0000 0002` | 2 | next leaf is page 2 |
+| `0000` | 0 | level, 0 means leaf |
+| `0000` | — | padding, keeps slots 4-byte aligned |
+| `0ff2 000e` | 4082, 14 | slot 0 points at a 14-byte cell |
+| `0fe4 000e` | 4068, 14 | slot 1 points at a 14-byte cell |
+
+Slot 0 says byte 4082 of page 1, which is file offset `4096 + 4082 = 8178`:
+
+```
+$ xxd -s 8178 -l 14 tree.db
+00001ff2: 7fff ffff ffff ffff 0000 0064 0000       ...........d..
+```
+
+`7F FF FF FF FF FF FF FF` is the key **-1**, sign bit flipped by the ordered
+encoding from `0x03`. Then `0000 0064` is row page 100, and `0000` is slot 0.
+Every layer built so far is visible in those fourteen bytes.
+
+**Walking the tree with no pointers at all**, reading pages back from the file:
+
+```
+looking up 30, starting at page 0
+  read page 0 at byte offset 0, kind btree-internal, 1 keys
+  not a leaf, so follow a page id: next is page 2
+  read page 2 at byte offset 8192, kind btree-leaf, 2 keys
+  found at slot 1 -> row id page 200 slot 30
+```
+
+**How the real ones do it.** Postgres calls a page number a `BlockNumber`, a
+`uint32` index into the relation file, and its B-Tree pages carry a `btpo_level`
+exactly like the level field here. SQLite uses 1-based 32-bit page numbers, with
+page 1 always holding the schema. InnoDB uses 32-bit page numbers inside a
+tablespace with 16 KB pages. Nobody stores an address.
+
+**How it is verified.** `Validate` checks twelve structural facts, including that
+the cells exactly tile the region from `free end` to the end of the page with no
+gaps and no overlaps, and that the slot array is in strictly ascending key order.
+Eleven separate corruptions are asserted to fail it. `TestGoldenLeafLayout`
+pins fourteen exact byte ranges so the format cannot drift silently, and
+`TestMaxKeysMatchesWhatActuallyFits` fills a page for every key length from 1 to
+64 and checks the count against the arithmetic. A fuzz target built pages from
+arbitrary keys for 2.38M executions.
+
+Run it: `make demo-nodepage`.
+
+---
+
 ## Layout
 
 ```
@@ -676,6 +817,7 @@ internal/
   nullbits/         null bitmaps and SQL three-valued logic
   slots/            fixed-size, aligned record slots inside a page
   btree/            in-memory B+Tree: search, insert, split, range scans, delete
+  nodepage/         the on-disk byte layout of a B+Tree node
 ```
 
 ## Conventions
