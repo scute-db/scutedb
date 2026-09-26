@@ -70,3 +70,6 @@ demo-range:
 
 demo-delete:
 	go run ./cmd/scutedb-demo delete
+
+demo-nodepage:
+	go run ./cmd/scutedb-demo nodepage
