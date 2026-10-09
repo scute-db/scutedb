@@ -6,9 +6,9 @@ A *scute* is one of the bony plates that make up a turtle's shell. A shell is
 made of plates; a database file is made of pages. 
 
 
-**Status:** Phases 0 and A complete. Phase B has started: a B+Tree node now has
-a byte-for-byte on-disk format, and a tree can be walked straight out of a file
-using nothing but page numbers.
+**Status:** Phases 0 and A complete. Phase B is under way: a B+Tree node has a
+byte-for-byte on-disk format, and a storage manager allocates pages, recycles
+them, and finds the root again after a restart — including after a `kill -9`.
 
 ---
 
@@ -21,6 +21,7 @@ make demo-scan             # watch a file-based database degrade
 make hexdump               # write real pages and look at the bytes
 make demo-delete           # borrow, merge and root collapse, traced live
 make demo-nodepage         # decode a real B+Tree page out of a real file
+make demo-pagestore        # free lists, checkpoints, and twenty kill -9 restarts
 ```
 
 ---
@@ -656,7 +657,7 @@ Deliberate, each one is a later step:
 - ~~`Page.Append` writes items with no separator~~ → fixed in `0x03`
 - The B+Tree is pointers in memory and nothing persists → `0x09` (nodes become pages)
 - No way to find item *n* without walking items 1..*n-1* → `0x0F` (slot directory)
-- `File.Allocate` never reuses a freed page → `0x0A` (free list)
+- ~~`File.Allocate` never reuses a freed page~~ → fixed in `0x0A` (free list)
 - The reserved header bytes hold no checksum → `0x13`
 - Nothing is thread-safe → `0x0C`
 
@@ -800,6 +801,370 @@ arbitrary keys for 2.38M executions.
 
 Run it: `make demo-nodepage`.
 
+### `0x0A` The index storage manager
+
+`0x09` made a tree node into bytes. It left one question open, and it is the
+first thing any reader of the file asks: **where does the tree start?** After a
+restart nothing is in memory. A file holding 14 million perfectly formatted keys
+is useless if nothing says which page is the root.
+
+`internal/pagestore` answers it, and takes on everything that comes with owning
+a file: handing pages out, taking them back, growing the file, and making sure a
+crash at any moment leaves something that still makes sense.
+
+**The meta page is the one fixed address.** Page 0 is the only place a reader can
+look without being told where to look, so it holds everything needed to find
+everything else:
+
+```
+page 0, the meta page
+
+0000  00 00 00 00 01 00 00 00  00 38 10 00 00 00 00 00  |.........8......|
+0010  53 43 55 54 45 44 42 00  00 00 00 01 00 00 10 00  |SCUTEDB.........|
+0020  00 00 00 01 00 00 00 00  00 00 00 00 00 00 00 02  |................|
+0030  00 00 00 10 00 00 00 02  00 00 00 00 00 00 00 00  |................|
+
+offset    bytes                      meaning
+16..23    53 43 55 54 45 44 42 00    magic = "SCUTEDB", NUL-terminated
+24..27    00 00 00 01                format version = 1
+28..31    00 00 10 00                page size = 4096
+32..35    00 00 00 01                root = page 1
+36..39    00 00 00 00                free list = none (nothing is free)
+40..43    00 00 00 00                free page count = 0
+44..47    00 00 00 02                next page to hand out = 2
+48..51    00 00 00 10                pages the file holds = 16 (65536 bytes)
+52..55    00 00 00 02                checkpoint generation = 2
+```
+
+Page 0 doubles as the "no page" value — `root = 0` means no root yet, and a
+free-list chain ends at 0. That is the trick `0x04` warned against, and here it is
+safe for exactly the reason it was unsafe there: a sentinel is only dangerous when
+the value it steals could be real. `-1` can be a real integer. Page 0 can never be
+a root or a free page, because it is always this page.
+
+**Magic numbers and versions exist to refuse.**
+
+```
+open a text file          -> rejected, not a scutedb file
+open a version-2 file     -> rejected, unknown format version
+open 8192-byte pages      -> rejected, wrong page size
+```
+
+None of those would crash if accepted. Reading 8 KB pages as 4 KB pages would
+quietly return wrong rows, which is worse. Two rules make the refusal *useful*:
+
+- **The magic never carries the version.** An earlier draft ended the magic with
+  a `01` byte, so a version-2 file would have been called foreign rather than
+  newer. The magic answers "is this ours?"; the version field answers "which
+  one?". Keeping them apart is what lets a reader say *this is a ScuteDB file,
+  newer than me* instead of *this is not a ScuteDB file*.
+- **Check identity, then version, then everything else.** Everything after the
+  version is allowed to change between versions — including the page header — so
+  a newer file must be recognised before any of it is read.
+
+SQLite's first sixteen bytes are `SQLite format 3` followed by a NUL, for the same
+reason.
+
+**The file grows in chunks.** Pages handed out and pages the file holds are two
+different numbers, so the meta page stores both:
+
+```
+handed out   file size        grown
+0            64.0 KB          1 times
+15           64.0 KB          1 times
+16           128.0 KB         2 times
+31           128.0 KB         2 times
+32           192.0 KB         3 times
+40           192.0 KB         3 times
+```
+
+Forty pages, three growths, one write each.
+
+**Free lists, and why a freed page has to wait.** The first draft of this step did
+what most tutorials do: freeing a page wrote a "free" marker and a next-pointer
+into the page itself, so the free list was a chain threaded through the free
+pages. Two crash tests broke it:
+
+- **Data loss.** Checkpoint a root, make a new root, free the old one — exactly
+  what a B+Tree root collapse does — then crash before the next checkpoint. On
+  restart the meta page correctly points at the old root, but `Free` had already
+  overwritten it. The last committed tree was destroyed by work that was never
+  committed.
+- **A corrupt free list.** Reusing a free page overwrote its link, so after a
+  crash the durable free list walked into a leaf.
+
+One cause behind both: **overwriting a page the last durable state still points
+at.** Until a new checkpoint is durable, nothing the previous one references may
+be touched. The fix is the design LMDB and BoltDB use:
+
+```
+Free(page)       goes on a PENDING list, bytes untouched
+                 not reusable until the checkpoint that stops referencing it
+
+checkpoint       pending pages join the free list
+                 the free list is written into its OWN pages, taken only from
+                 pages already free in the durable state — never from pending
+                 pages, never from the current free-list pages
+```
+
+```
+free pages 3, 4 and 5
+  reusable now               none
+  pending, after checkpoint  3 4 5
+
+allocate -> page 7. a NEW page, not one just freed.
+
+checkpoint
+  reusable now               3 4 5
+  holding the free list      8
+
+allocate -> page 5. reused, and the file did not grow.
+```
+
+The old free-list pages are listed as free in the new list, so they are recycled
+rather than leaked — two hundred allocate-free-checkpoint rounds keep the file at
+one chunk.
+
+**Data durability is not structural durability.** Data durability means a page's
+bytes reached the disk. Structural durability means the file *as a whole*
+describes a state that makes sense. A checkpoint turns the first into the second,
+and the order is the whole algorithm:
+
+```
+1. fsync            every page written since the last checkpoint
+2. write            the new free list into its own pages
+3. fsync            so the list is on disk
+4. write page 0     the new root, list, and page counts
+5. fsync            the commit point
+```
+
+The meta page is written last. A crash anywhere before step 5 leaves page 0
+describing the previous checkpoint, with nothing it points at disturbed. That
+relies on a 56-byte write being atomic, which holds because it sits inside one
+disk sector; Postgres makes the same bet with `pg_control`, which it keeps under
+512 bytes for exactly this reason. On macOS a plain `fsync` does not flush the
+drive's own write cache, but Go's `File.Sync` already issues `F_FULLFSYNC` there
+(falling back to `fsync` where a filesystem cannot do it), so these really do
+reach the storage.
+
+**The page cache is not the disk.** Most of what went wrong in this step came from
+one confusion. A read returns what the *operating system* holds, which is not
+necessarily what the *disk* holds. Three separate bugs trusted the first as if it
+were the second:
+
+| trusted as durable | what could really be on disk | fix |
+|---|---|---|
+| the meta page `Open` just read | an older meta page | **recovery-on-open**: rewrite the meta and fsync it before handing out a single page |
+| the file size | a shorter file | growth writes zeros for exactly the new pages, from the store's own count, never from the file's reported size |
+| the file's name in its directory | no directory entry at all | `Open` and `Create` fsync the directory that *really* holds the file, following symlinks, every time |
+
+The first is the subtle one. If a checkpoint's final fsync fails, or the process
+dies during it, the new meta page sits in the cache but not on disk. The next
+`Open` would believe it and start reusing pages the *on-disk* checkpoint still
+needs; a later power cut then reverts to that older checkpoint, now overwritten.
+Rewriting the meta on open makes what the store believes and what the disk holds
+agree before anything else happens. SQLite does the equivalent when it rolls back
+a hot journal on open.
+
+The directory row took three tries, and the way it went wrong twice is the lesson.
+The first fix fsynced `filepath.Dir(path)` — the directory named in the path's
+*text*. Through a symlink the kernel puts the file's entry in the *target's*
+directory, so the fsync hit the wrong one. The second fix resolved the path with
+`filepath.EvalSymlinks` and fsynced that. It was right about where the file is,
+but it built the whole resolved path as one string, which fails once it passes
+`PATH_MAX` even though the kernel reaches the same file one step at a time. And it
+also fsynced a "lexical parent" computed with `filepath.Dir`, which tidies away
+`..` before following symlinks and can name a directory that does not exist. Both
+made valid files unopenable.
+
+The third fix stops resolving paths in strings at all. It splits off the last
+component without cleaning anything, opens that prefix as a directory, and lets
+the kernel resolve every symlink and `..` along the way. The only thing it follows
+itself is a symlink in the *final* component, using `Lstat` and `Readlink` and
+joining the target onto the raw prefix.
+
+**A missing database is an error, not an empty database.** `Open` used to create
+the file if it did not exist. That is what turned every lost directory entry into
+silent data loss: after a power cut dropped the file's name, the next `Open`
+quietly handed back a fresh, empty store. Now only `Create` makes files, and
+`Open` of a missing path fails with `fs.ErrNotExist`. `Open` still initialises a
+file that exists but is blank, because that is what an interrupted `Create` leaves
+behind.
+
+**When fsync fails, stop.** Any failed fsync poisons the store; every later call
+returns `ErrPoisoned`, carrying the original error, until the file is reopened.
+In 2018 Postgres found that Linux could drop dirty pages on a failed fsync, mark
+them clean, and report success on the retry — so a retry can "succeed" having
+written nothing. Postgres now panics instead. Errors that happen before anything
+durable is touched, such as running out of page ids, return plainly and leave the
+store usable.
+
+One consequence worth stating plainly: **after a failed checkpoint, the outcome
+is unknown.** If only the final fsync failed, the new meta may already be in the
+cache, and the next `Open` will make it durable. The caller has to reopen and read
+the root to find out — the same position as a Postgres client whose `COMMIT` timed
+out.
+
+**Restart as a test.** The demo runs a child process that loops — new root, stamp
+it with the checkpoint number it is about to produce, free the old root,
+checkpoint — and `kill -9`s it at an arbitrary moment, twenty times:
+
+```
+run   child said   file says    root stamp verify
+1     4            5            5          ok
+2     6            6            6          ok
+3     6            7            7          ok
+...
+19    26           27           27         ok
+20    27           27           27         ok
+
+20 of 20 recovered to a consistent checkpoint.
+```
+
+"File says" is sometimes one ahead: the child finished a checkpoint and died
+before it could print. What must never happen is the file being *behind*.
+
+The same thing runs as an ordinary test, `TestARealKillNineAtAnyMomentAlwaysRecovers`.
+The test binary starts a copy of itself as the child, kills it with a real
+`kill -9` twelve times at different moments, and checks each file. So it runs in
+CI on Linux with every pull request, not only when someone runs the demo.
+
+A `kill -9` only kills the process; the OS still flushes what it was handed. The
+harder cases cannot be staged from a demo, so the tests use a simulated disk that
+models an operating system in front of a drive:
+
+- a **power cut** keeps the last synced image plus any chosen subset of the writes
+  since;
+- a **failed fsync** behaves like Linux after 2018 — some writes land, the rest are
+  marked clean and never reach the disk, though reads still see them;
+- a **process restart** keeps the page cache, which is exactly where the
+  cache-versus-disk bugs live;
+- **eviction** lets those clean-but-unwritten pages silently revert to the older
+  bytes on disk.
+
+`FuzzCrashAnywhereKeepsTheLastCheckpoint` runs random sequences of allocate, free,
+set-root, checkpoint, clean restart, process crash, power cut, failed checkpoint
+and failed sync, and after every single step checks that every page the last
+checkpoint referenced still holds its original bytes, and that every page ever
+handed out is in exactly one state. It ran 2,436,886 executions of up to 400
+operations each.
+
+**What independent review found.** Four reviewers, each working in a private copy
+of the repository, attacked the first version from different angles — crash
+consistency, page accounting, the file format, and misuse of the API. Every
+finding had to come with a failing test, and a separate skeptic had to reproduce
+it before it counted. A second round attacked the fixes; one of its reviewers
+wrote an independent crash fuzzer from scratch, with a different definition of
+"correct", and it found nothing. A third round attacked what the second round
+changed, and a fourth attacked what the third changed — finding that the third
+round's own fix had introduced two ways to make a valid file unopenable.
+
+| bug | severity | found by |
+|---|---|---|
+| `Free` overwrote pages the last checkpoint still referenced | data loss | crash tests, first draft |
+| `Open` trusted a meta page that existed only in the cache | data loss | review, round 1 |
+| a failed `Sync` did not poison, so the next checkpoint committed lost pages | data loss | review, round 1 |
+| page ids could wrap past 2³² into the meta page | data loss | review, round 1 |
+| a root that was also a free-list page was accepted, and later handed out | corruption | review, round 1 |
+| a crash during `Create` left a file that could never be opened | unrecoverable | review, round 1 |
+| `Verify` never compared live state with the durable free list | blind spot | review, round 1 |
+| growth trusted the file size the cache reported | corruption | **the fuzzer, while testing another fix** |
+| the directory was fsynced only when `Open` created the file | data loss | review, round 2 |
+| running out of page ids reported "an fsync failed" and hid the cause | wrong error | review, round 2 |
+| the directory fsync followed the path's text, not its symlink | data loss | review, round 3 |
+| that fix built the resolved path as one string, which fails past `PATH_MAX` | unopenable | review, round 4 |
+| that fix also tidied away `..` before following symlinks | unopenable | review, round 4 |
+| a failed `Allocate` that had grown the file left the store reporting the bigger size | wrong state | fault-injection tests |
+| a failed `Write` still marked the store as needing a checkpoint | wrong state | fault-injection tests |
+
+**How strong are the tests?** A test suite can pass and still miss bugs. Two
+measures say how much it would really catch.
+
+*Coverage* asks which lines run during the tests. It is the weaker measure: a
+line can run without any test checking its result.
+
+*Mutation testing* is the stronger one. A script breaks the code on purpose —
+flips a `<` to `<=`, switches off an `if`, makes an error return `nil`, deletes
+a line that updates state — one change at a time, 563 changes in all. For each
+broken copy it runs the whole suite. If no test fails, that break "survived",
+which means the tests would not have noticed that bug.
+
+Every fix above was also broken on purpose by hand, and all 28 were caught. That
+number turned out to be flattering: those were the exact spots I had just fixed.
+The full sweep told a different story:
+
+```
+                         before hardening    after hardening
+coverage, storage code   79.7%               93.5%
+mutation score           68.9%               93.1%
+breaks nobody caught     174                 39
+tests                    181                 238
+```
+
+The 174 surviving breaks pointed straight at what was missing, and that drove a
+round of new tests:
+
+- **Hostile files.** 81 ways of damaging a real store's bytes on disk, each of
+  which `Open` must reject with the right error *and without changing the file*,
+  plus a fuzzer that fed `Open` random bytes 20.7 million times.
+- **Fault injection.** A fake file that fails the Nth write, read, sync or size
+  call, or tears a write halfway. It does this at 251 separate points inside
+  every operation, and after each one checks that the store either stayed
+  exactly as it was or poisoned itself, and that the file still reopens.
+- **An independent oracle.** A second crash fuzzer that reads the bytes on the
+  simulated disk with its *own* decoder, instead of trusting the store's.
+- **Each safety check on its own.** `Open` checks a file twice: once with
+  `checkMeta` and `checkFreeSet`, once with `verifyLive`. Break either and the
+  other still catches it, so the sweep could never test them separately. Now
+  each one is also tested directly.
+- **A real `kill -9`** as an ordinary test, described above.
+
+The sweep also caught **weak tests I had written**. Six symlink tests passed if
+`Open` failed for *any* reason, not the right one. A `Discard` test passed only
+because the test itself called `Close` afterwards. Both now check the exact
+cause.
+
+The 39 breaks still surviving were each checked by hand. None is an untested
+gap. They fall into three groups:
+
+```
+17  no observable difference   e.g. capping at a limit with > or >= gives the same value
+15  a second check catches it   two layers guard the same thing; each is tested alone
+ 7  needs a faked OS failure    e.g. closing a directory failing, which the OS
+                                will not do on demand
+```
+
+In short: coverage says the code ran; mutation testing says the tests would
+notice if it were wrong. The second number went from 69% to 93%.
+
+**How the real ones do it.** SQLite's header is page 1, with a free list of trunk
+pages that each list leaf pages. BoltDB keeps two alternating meta pages chosen by
+transaction id and checksum, writes its free list to a fresh page on every commit,
+and holds freed pages as pending until no reader can still see them. LMDB tracks
+free pages in a B-Tree of its own. Postgres keeps its checkpoint location in
+`pg_control`.
+
+**Known limits**, each deliberate:
+
+- A single meta page relies on a sector-sized write being atomic. Two alternating
+  meta pages with checksums remove that assumption; checksums arrive in `0x13`.
+- A database path whose *final* component is a symlink with a relative target
+  cannot be opened if that target, joined to the link's directory, is longer than
+  `PATH_MAX` (1024 bytes on macOS). Resolving it without building that string
+  needs `openat`, which Go's standard library does not expose on macOS.
+- A full disk with an empty free list cannot checkpoint, because the new free list
+  needs a page nothing durable references.
+- A directory fsync is treated as done when the filesystem says it cannot do one
+  at all (`EINVAL`, `ENOTSUP`), as SQLite does; on those filesystems a new file's
+  name is only as durable as the filesystem makes it. Every other error fails.
+- There is no file lock, so two processes can open the same store; that belongs
+  with concurrency in `0x0C`. Windows is not supported.
+- A checkpoint can occasionally write one empty trailing free-list page; it is
+  valid, and recycled at the next checkpoint.
+- Nothing is thread-safe yet (`0x0C`), and the B+Tree does not use this store yet.
+
+Run it: `make demo-pagestore`.
+
 ---
 
 ## Layout
@@ -818,6 +1183,7 @@ internal/
   slots/            fixed-size, aligned record slots inside a page
   btree/            in-memory B+Tree: search, insert, split, range scans, delete
   nodepage/         the on-disk byte layout of a B+Tree node
+  pagestore/        page allocation, free list, meta page, checkpoints
 ```
 
 ## Conventions

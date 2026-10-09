@@ -73,3 +73,6 @@ demo-delete:
 
 demo-nodepage:
 	go run ./cmd/scutedb-demo nodepage
+
+demo-pagestore:
+	go build -o /tmp/scutedb-demo ./cmd/scutedb-demo && /tmp/scutedb-demo pagestore

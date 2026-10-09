@@ -27,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range|delete|nodepage")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range|delete|nodepage|pagestore")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -57,6 +57,10 @@ func main() {
 		expDelete()
 	case "nodepage":
 		expNodePage()
+	case "pagestore":
+		expPageStore()
+	case "store-child":
+		storeChild(os.Args[2])
 	case "crash-child":
 		crashChild(os.Args[2])
 	default:
