@@ -3,6 +3,7 @@ package page
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/fileio"
@@ -22,6 +23,7 @@ const (
 	KindHeap
 	KindBTreeLeaf
 	KindBTreeInternal
+	KindFreeList
 )
 
 func (k Kind) String() string {
@@ -36,6 +38,8 @@ func (k Kind) String() string {
 		return "btree-leaf"
 	case KindBTreeInternal:
 		return "btree-internal"
+	case KindFreeList:
+		return "free-list"
 	}
 	return fmt.Sprintf("kind(%d)", uint8(k))
 }
@@ -107,7 +111,11 @@ func (pf *File) PageCount() (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return uint32(size / Size), nil
+	n := size / Size
+	if n > math.MaxUint32 {
+		n = math.MaxUint32
+	}
+	return uint32(n), nil
 }
 
 func (pf *File) Read(id core.PageID) (Page, error) {
@@ -128,6 +136,30 @@ func (pf *File) Write(p Page) error {
 	}
 	_, err := pf.f.WriteAt(p, Offset(p.ID()))
 	return err
+}
+
+const growPiece = 256
+
+func (pf *File) Grow(from, to uint32) error {
+	if to <= from {
+		return nil
+	}
+	n := to - from
+	if n > growPiece {
+		n = growPiece
+	}
+	zero := make([]byte, int(n)*Size)
+	for at := from; at < to; {
+		step := to - at
+		if step > growPiece {
+			step = growPiece
+		}
+		if _, err := pf.f.WriteAt(zero[:int(step)*Size], Offset(core.PageID(at))); err != nil {
+			return err
+		}
+		at += step
+	}
+	return nil
 }
 
 func (pf *File) Allocate(kind Kind) (Page, error) {
