@@ -6,9 +6,9 @@ A *scute* is one of the bony plates that make up a turtle's shell. A shell is
 made of plates; a database file is made of pages. 
 
 
-**Status:** Phases 0 and A complete. Phase B is under way: a B+Tree node has a
-byte-for-byte on-disk format, and a storage manager allocates pages, recycles
-them, and finds the root again after a restart — including after a `kill -9`.
+**Status:** Phases 0 and A complete. Phase B is under way: a storage manager
+allocates and recycles pages, a buffer pool keeps the hot ones in memory, and the
+B+Tree now lives on disk and survives a restart.
 
 ---
 
@@ -22,6 +22,7 @@ make hexdump               # write real pages and look at the bytes
 make demo-delete           # borrow, merge and root collapse, traced live
 make demo-nodepage         # decode a real B+Tree page out of a real file
 make demo-pagestore        # free lists, checkpoints, and twenty kill -9 restarts
+make demo-bufpool          # LRU vs LRU-K under a scan, and a disk B+Tree that survives a restart
 ```
 
 ---
@@ -1161,9 +1162,180 @@ free pages in a B-Tree of its own. Postgres keeps its checkpoint location in
   with concurrency in `0x0C`. Windows is not supported.
 - A checkpoint can occasionally write one empty trailing free-list page; it is
   valid, and recycled at the next checkpoint.
-- Nothing is thread-safe yet (`0x0C`), and the B+Tree does not use this store yet.
+- Nothing is thread-safe yet (`0x0C`). The B+Tree uses this store from `0x0B`,
+  through the buffer pool.
 
 Run it: `make demo-pagestore`.
+
+### `0x0B` Buffer pool
+
+`0x0A` can hand out pages and find the root after a restart. But every read
+still goes to the file. A **buffer pool** is a fixed set of page-sized slots in
+memory, called **frames**, that keeps recently used pages close. This step builds
+one in `internal/bufpool`, and then moves the B+Tree onto disk for real:
+`internal/disktree` stores every node in a page and reaches it through the pool.
+
+In short: the pool decides which pages stay in memory; the tree no longer knows
+or cares whether a node came from memory or from the file.
+
+**What the pool holds.** A *page table* maps a page id to the frame that holds
+it. Each frame has a *pin count* (how many callers are using it right now) and a
+*dirty* flag (it changed since it was read).
+
+```
+page table              frames (one 4 KB buffer each, allocated once)
+  page 7  -> frame 2      frame 0  page 12  pins 0  clean
+  page 12 -> frame 0      frame 1  (free)
+  page 31 -> frame 3      frame 2  page 7   pins 2  dirty
+                          frame 3  page 31  pins 0  clean
+```
+
+`Fetch(id)` pins a page, reading it from the file only on a miss. `Unpin(f, dirty)`
+gives it back. A pinned frame is never evicted; if every frame is pinned, `Fetch`
+fails with `ErrNoFreeFrame`. `Frame.Page()` is the live buffer, so two callers
+that pin the same page see each other's changes.
+
+**When does a changed page reach the file?** Two modes. *Write-through* writes a
+page every time it is unpinned dirty. *Write-back* waits until the page is evicted
+or flushed. Inserting 20,000 keys in random order into a disk tree through a
+16-frame pool:
+
+```
+mode           page writes   per insert
+write-back     12,735        0.64
+write-through  20,255        1.01
+```
+
+**Choosing a victim.** When the pool is full, a *replacer* picks the frame to
+reuse. Each of the three is tested with exact eviction orders:
+
+- **LRU** evicts the page unused for longest.
+- **Clock** gives each frame one bit, set on use. A hand sweeps the frames; a
+  set bit is cleared and skipped (a "second chance"), a clear bit is the victim.
+  Nearly LRU, with less bookkeeping.
+- **LRU-K** (K = 2) ranks a page by its K-th most recent use. A page used fewer
+  than K times counts as infinitely old, so it goes first, oldest first. Each
+  frame keeps K timestamps, so `New` refuses a K above 64 (`MaxK`).
+
+**Sequential flooding** is why LRU-K exists. A 64-frame pool over a real file;
+48 hot pages are read again and again; a scan reads 1,000 cold pages once each:
+
+```
+scan 1,000 pages, then read the hot set (3 rounds)
+policy  hot hits    hot      all accesses
+LRU     0/144       0.0%     0.0%
+Clock   0/144       0.0%     0.0%
+LRU-K   144/144     100.0%   4.6%
+
+one cold page, one hot page, ... (2,000 pairs)
+LRU     16/2000     0.8%     0.4%
+Clock   32/2000     1.6%     0.8%
+LRU-K   2000/2000   100.0%   50.0%
+```
+
+LRU treats the scan's pages as the most valuable, because they are the newest.
+LRU-K sees that each was used once, so scan pages evict each other and the hot
+set stays. `TestASequentialScanWipesTheHotSetUnderLRUButNotUnderLRUK` asserts it.
+
+How the real ones do it: Postgres uses clock-sweep with a small use counter per
+buffer, and gives a big sequential scan its own small *ring* of buffers so it
+cannot flood the rest. InnoDB inserts new pages in the middle of its LRU list, and
+only promotes them if they are touched again after a delay. SQLite keeps a plain
+LRU cache per connection.
+
+**The B+Tree on disk.** `disktree` is a B+Tree whose nodes are `nodepage` pages.
+Each operation pins one or two frames at a time and unpins all of them on every
+path; tests check that no frame is left pinned after any operation, even with a
+failing disk. An iterator holds no pin between `Next` calls: it copies one
+leaf's keys, and to refill it walks down from the root to the last key it
+returned, so a scan keeps working while the tree changes under it.
+
+**The root never moves.** When the root splits, its contents are copied into
+two new pages and the root page becomes their parent. Its page id stays the
+same, so the id is stored once, in the meta page, forever. SQLite does the same.
+In the demo, 50,000 random inserts take the tree from height 1 to 3; the root
+split twice and was page 1 throughout.
+
+```
+before                       after
+page 1: [a b c d e]          page 1: [c]  ->  page 9, page 10
+                             page 9: [a b]    page 10: [c d e]
+```
+
+**Splits go by bytes, not by count.** Keys have different lengths, so a node
+splits where the bytes balance. Keys are limited to 1,000 bytes (`MaxKeySize`),
+which guarantees at least four entries per node. When two split points balance
+equally well, the first one wins, so the page that stays keeps the smaller half.
+Inserted in order, 400 eight-byte keys need 3 leaves and 2 levels; 400 keys of
+1,000 bytes need 199 leaves and 6 levels.
+
+**Delete never merges.** A delete removes the key from its leaf and stops. A leaf
+may end up nearly empty, or completely empty, and the tree is still valid. After
+deleting 90% of 50,000 keys, the tree still has all 288 leaves; they went from 77%
+full to 8% full. Merging would make a delete change a leaf, its sibling and their
+parent at once. In `0x0D`, where readers and writers share the tree, that would
+mean holding more locks at once, and a scan could land on a page that a merge
+just removed. Without merges, a delete touches one leaf, and a page that was part
+of the tree stays part of it. Postgres's B-Tree never merges either; it removes a
+page only once it is completely empty, during `VACUUM`.
+
+**Splits allocate first and write last.** A split builds every new node in
+memory and allocates every page it needs before it changes anything; if an
+allocation fails, those pages are freed. Then it copies the images into their
+frames, new pages first and old pages top-down, so a parent learns about a new
+right page before the left page gives up its upper half. If a read or write
+fails before any old page changed, the split is undone. After that point, the
+tree keeps the remaining images in memory: reads still find every key, and the
+next `Put`, `Delete`, `Validate` or `Close` writes them first and refuses
+everything else until it can. In write-through mode a failed write never stops a
+split; the image is in its frame, and the pool retries the write at the next
+unpin. Cutting splits short at each of the first eight reads or writes, in 8
+setups, undid 51 and left 8 for the next change to finish; each time the tree
+validated and owned exactly the pages the store had handed out.
+
+**Bytes from disk are checked before use.** The pool clears a frame's *verified*
+mark whenever it reads the page from the file. The tree runs `Validate` on a
+node the first time it sees it after that, so a cache hit costs nothing extra.
+A child must sit exactly one level below its parent, which makes a cycle of
+child pointers impossible. A split reads the parent again just before changing
+it; if that copy no longer points at the child the split came from (an older
+copy came back from the file, say), the split stops with `ErrCorrupt`. A scan's
+keys must strictly increase, and a leaf chain that loops back stops with
+`ErrCorrupt`. A fuzzer damages one page of a real tree and checks that nothing
+panics and no pin is left behind.
+
+`nodepage` gained `InsertLeaf`, `InsertInternal`, `Remove`, `SetRow` and
+`SetChild`. `Remove` closes the gap at once, so freed bytes are reusable straight
+away, as in Postgres; SQLite keeps a list of free blocks in the page instead.
+
+**How strong are the tests?** Statement coverage is 99.7% for `bufpool`, 97.5%
+for `disktree` and 96.9% for `nodepage`. The model tests run random puts,
+deletes, gets and scans against a Go map through an 8-frame pool; one run made
+122,899 evictions. Of eighteen bugs planted by hand, seventeen made a test fail
+(one only by hanging; scans now fail at once on a key that does not increase).
+The last, write-through not retrying a failed write, now has its own test. A
+review then made 288 small automatic changes (*mutants*), one at a time: 211 made
+a test fail, and 41 of the rest were real gaps that now each have a test. Four
+fuzzers ran 60 seconds each and found nothing: 898,627 runs of tree operations
+against a map, 53,251 on a tree with one damaged page, 45,885 of the pool
+against a model, 27,399 of node edits.
+
+**Known limits**, each deliberate:
+
+- Nothing is safe for concurrent use yet; that is `0x0C`.
+- The tree overwrites pages in place, so the file is whole only after a clean
+  `FlushAll` and checkpoint; a crash in between can leave it part old and part
+  new. The write-ahead log in `0x14` fixes that. In memory the tree is never
+  left half split, but a `Put` that fails late in its split is finished by the
+  next change, not rolled back.
+- Pages emptied by deletes are never given back to the store.
+- Leaves split in half even when keys arrive in order, so an in-order load leaves
+  them about half full. Postgres and SQLite both have a special case for this.
+- Separators are full copies of keys; shortening them would fit more per page.
+- LRU-K forgets a page's history when the page is evicted. The original design
+  keeps it for a while longer.
+
+Run it: `make demo-bufpool`.
 
 ---
 
@@ -1184,6 +1356,8 @@ internal/
   btree/            in-memory B+Tree: search, insert, split, range scans, delete
   nodepage/         the on-disk byte layout of a B+Tree node
   pagestore/        page allocation, free list, meta page, checkpoints
+  bufpool/          buffer pool: frames, pins, dirty pages, LRU / Clock / LRU-K
+  disktree/         the B+Tree on disk: nodepage pages reached through the pool
 ```
 
 ## Conventions
