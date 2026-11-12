@@ -90,6 +90,11 @@ func seeded(t *testing.T, n int) (*MemSource, []core.PageID) {
 	return src, ids
 }
 
+func (p *Pool) peek(id core.PageID) (*Frame, bool) {
+	f, ok := p.tables[p.locks.Index(uint64(id))][id]
+	return f, ok
+}
+
 func mustPool(t *testing.T, src Source, opts Options) *Pool {
 	t.Helper()
 	p, err := New(src, opts)

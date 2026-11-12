@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/fileio"
@@ -94,6 +95,7 @@ func (st pageState) String() string {
 }
 
 type Store struct {
+	mu      sync.Mutex
 	pf      *page.File
 	durable Meta
 
@@ -450,13 +452,33 @@ func (s *Store) usable() error {
 	return nil
 }
 
-func (s *Store) Durable() Meta { return s.durable }
-func (s *Store) Stats() Stats  { return s.stats }
-func (s *Store) Dirty() bool   { return s.dirty }
+func (s *Store) Durable() Meta {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.durable
+}
 
-func (s *Store) Root() core.PageID { return s.root }
+func (s *Store) Stats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats
+}
+
+func (s *Store) Dirty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dirty
+}
+
+func (s *Store) Root() core.PageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.root
+}
 
 func (s *Store) Meta() Meta {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m := s.durable
 	m.Root = s.root
 	m.NextPage = s.nextPage
@@ -465,9 +487,23 @@ func (s *Store) Meta() Meta {
 	return m
 }
 
-func (s *Store) FreePages() []core.PageID    { return append([]core.PageID(nil), s.free...) }
-func (s *Store) PendingPages() []core.PageID { return append([]core.PageID(nil), s.pending...) }
-func (s *Store) ListPages() []core.PageID    { return append([]core.PageID(nil), s.listPage...) }
+func (s *Store) FreePages() []core.PageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]core.PageID(nil), s.free...)
+}
+
+func (s *Store) PendingPages() []core.PageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]core.PageID(nil), s.pending...)
+}
+
+func (s *Store) ListPages() []core.PageID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]core.PageID(nil), s.listPage...)
+}
 
 func (s *Store) inRange(id core.PageID) error {
 	if id == MetaPage || uint32(id) >= uint32(s.nextPage) {
@@ -487,6 +523,8 @@ func (s *Store) owned(id core.PageID) error {
 }
 
 func (s *Store) SetRoot(id core.PageID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}
@@ -501,6 +539,8 @@ func (s *Store) SetRoot(id core.PageID) error {
 }
 
 func (s *Store) Read(id core.PageID) (page.Page, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return nil, err
 	}
@@ -511,6 +551,8 @@ func (s *Store) Read(id core.PageID) (page.Page, error) {
 }
 
 func (s *Store) Write(p page.Page) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}
@@ -525,6 +567,8 @@ func (s *Store) Write(p page.Page) error {
 }
 
 func (s *Store) Allocate(kind page.Kind) (page.Page, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return nil, err
 	}
@@ -577,6 +621,8 @@ func (s *Store) Allocate(kind page.Kind) (page.Page, error) {
 }
 
 func (s *Store) Free(id core.PageID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}
@@ -603,6 +649,8 @@ func (s *Store) Free(id core.PageID) error {
 }
 
 func (s *Store) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}
@@ -613,6 +661,12 @@ func (s *Store) Sync() error {
 }
 
 func (s *Store) Checkpoint() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checkpointNow()
+}
+
+func (s *Store) checkpointNow() error {
 	if err := s.usable(); err != nil {
 		return err
 	}
@@ -736,12 +790,14 @@ func (s *Store) checkpoint() error {
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
 	var err error
 	if s.poisoned == nil && s.dirty {
-		err = s.Checkpoint()
+		err = s.checkpointNow()
 	}
 	s.closed = true
 	cerr := s.pf.Close()
@@ -755,6 +811,8 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Discard() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
@@ -763,6 +821,8 @@ func (s *Store) Discard() error {
 }
 
 func (s *Store) Verify() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}

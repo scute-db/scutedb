@@ -108,7 +108,7 @@ func (c *poolChecker) step(op, arg int) {
 				t.Fatal(err)
 			}
 			for _, f := range p.frames {
-				if f.used && f.dirty {
+				if f.state != stFree && f.dirty {
 					t.Fatalf("page %d is still dirty after FlushAll", f.id)
 				}
 			}
@@ -121,7 +121,7 @@ func (c *poolChecker) step(op, arg int) {
 		if err := p.Flush(id); err != nil {
 			t.Fatal(err)
 		}
-		if i, ok := p.table[id]; ok && p.frames[i].dirty {
+		if f, ok := p.peek(id); ok && f.dirty {
 			t.Fatalf("page %d is still dirty after Flush", id)
 		}
 	case 6:
@@ -168,9 +168,8 @@ func (c *poolChecker) check() {
 		if err != nil {
 			t.Fatal(err)
 		}
-		i, resident := p.table[id]
+		f, resident := p.peek(id)
 		if resident {
-			f := p.frames[i]
 			if f.pins != pinned[id] {
 				t.Fatalf("page %d has %d pins, the test holds %d", id, f.pins, pinned[id])
 			}

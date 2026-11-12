@@ -141,7 +141,7 @@ func TestDeleteNeverMergesSoNodesMayEmptyAndTheTreeStaysValid(t *testing.T) {
 
 func TestNodesSplitByBytesSoBigKeysMeanFewerPerNode(t *testing.T) {
 	small, _ := newTree(t, 8)
-	big, _ := newTree(t, 8)
+	big, _ := newTree(t, MinFrames(5))
 	for i := 0; i < 400; i++ {
 		mustPut(t, small, k8(i), ridOf(i))
 		k := bytes.Repeat([]byte{byte(i >> 8), byte(i)}, nodepage.MaxKeySize/2)
@@ -161,7 +161,7 @@ func TestNodesSplitByBytesSoBigKeysMeanFewerPerNode(t *testing.T) {
 }
 
 func TestMixedKeySizesSplitIntoHalvesThatFit(t *testing.T) {
-	tr, _ := newTree(t, 6)
+	tr, _ := newTree(t, MinFrames(4))
 	model := map[string]core.RowID{}
 	sizes := []int{1, 999, 3, 1000, 17, 500, 2, 750, 64, 1000}
 	for i := 0; i < 3000; i++ {

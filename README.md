@@ -7,8 +7,9 @@ made of plates; a database file is made of pages.
 
 
 **Status:** Phases 0 and A complete. Phase B is under way: a storage manager
-allocates and recycles pages, a buffer pool keeps the hot ones in memory, and the
-B+Tree now lives on disk and survives a restart.
+allocates and recycles pages, a buffer pool keeps the hot ones in memory and is
+safe for many goroutines, and the B+Tree lives on disk, survives a restart, and
+changes through all-or-nothing mini-transactions.
 
 ---
 
@@ -23,6 +24,7 @@ make demo-delete           # borrow, merge and root collapse, traced live
 make demo-nodepage         # decode a real B+Tree page out of a real file
 make demo-pagestore        # free lists, checkpoints, and twenty kill -9 restarts
 make demo-bufpool          # LRU vs LRU-K under a scan, and a disk B+Tree that survives a restart
+make demo-latch            # a deadlock caught and released, lock order, lock striping
 ```
 
 ---
@@ -1202,7 +1204,7 @@ or flushed. Inserting 20,000 keys in random order into a disk tree through a
 
 ```
 mode           page writes   per insert
-write-back     12,735        0.64
+write-back     12,517        0.63
 write-through  20,255        1.01
 ```
 
@@ -1244,7 +1246,8 @@ only promotes them if they are touched again after a delay. SQLite keeps a plain
 LRU cache per connection.
 
 **The B+Tree on disk.** `disktree` is a B+Tree whose nodes are `nodepage` pages.
-Each operation pins one or two frames at a time and unpins all of them on every
+Reads pin one frame at a time; a split pins every page it changes at once, up to
+`2 x height + 1` frames (`disktree.MinFrames`). Every pin is released on every
 path; tests check that no frame is left pinned after any operation, even with a
 failing disk. An iterator holds no pin between `Next` calls: it copies one
 leaf's keys, and to refill it walks down from the root to the last key it
@@ -1279,19 +1282,11 @@ just removed. Without merges, a delete touches one leaf, and a page that was par
 of the tree stays part of it. Postgres's B-Tree never merges either; it removes a
 page only once it is completely empty, during `VACUUM`.
 
-**Splits allocate first and write last.** A split builds every new node in
-memory and allocates every page it needs before it changes anything; if an
-allocation fails, those pages are freed. Then it copies the images into their
-frames, new pages first and old pages top-down, so a parent learns about a new
-right page before the left page gives up its upper half. If a read or write
-fails before any old page changed, the split is undone. After that point, the
-tree keeps the remaining images in memory: reads still find every key, and the
-next `Put`, `Delete`, `Validate` or `Close` writes them first and refuses
-everything else until it can. In write-through mode a failed write never stops a
-split; the image is in its frame, and the pool retries the write at the next
-unpin. Cutting splits short at each of the first eight reads or writes, in 8
-setups, undid 51 and left 8 for the next change to finish; each time the tree
-validated and owned exactly the pages the store had handed out.
+**A split is all or nothing.** A split runs inside one mini-transaction (see
+`0x0C`): it pins and write-latches every page it will change, and allocates
+every new page, before it changes any of them. If a read, a write or an
+allocation fails on the way, the mini-transaction puts every page back and
+frees the new pages, so the tree is exactly as it was.
 
 **Bytes from disk are checked before use.** The pool clears a frame's *verified*
 mark whenever it reads the page from the file. The tree runs `Validate` on a
@@ -1311,7 +1306,7 @@ away, as in Postgres; SQLite keeps a list of free blocks in the page instead.
 **How strong are the tests?** Statement coverage is 99.7% for `bufpool`, 97.5%
 for `disktree` and 96.9% for `nodepage`. The model tests run random puts,
 deletes, gets and scans against a Go map through an 8-frame pool; one run made
-122,899 evictions. Of eighteen bugs planted by hand, seventeen made a test fail
+129,107 evictions. Of eighteen bugs planted by hand, seventeen made a test fail
 (one only by hanging; scans now fail at once on a key that does not increase).
 The last, write-through not retrying a failed write, now has its own test. A
 review then made 288 small automatic changes (*mutants*), one at a time: 211 made
@@ -1322,12 +1317,10 @@ against a model, 27,399 of node edits.
 
 **Known limits**, each deliberate:
 
-- Nothing is safe for concurrent use yet; that is `0x0C`.
 - The tree overwrites pages in place, so the file is whole only after a clean
   `FlushAll` and checkpoint; a crash in between can leave it part old and part
   new. The write-ahead log in `0x14` fixes that. In memory the tree is never
-  left half split, but a `Put` that fails late in its split is finished by the
-  next change, not rolled back.
+  left half split, and a `Put` that fails is rolled back by its mini-transaction.
 - Pages emptied by deletes are never given back to the store.
 - Leaves split in half even when keys arrive in order, so an in-order load leaves
   them about half full. Postgres and SQLite both have a special case for this.
@@ -1336,6 +1329,180 @@ against a model, 27,399 of node edits.
   keeps it for a while longer.
 
 Run it: `make demo-bufpool`.
+
+### `0x0C` Concurrency — locks and the race detector
+
+Up to `0x0B`, one goroutine did everything. Now many goroutines can share the
+buffer pool, the page store and the disk B+Tree at once. A new package,
+`internal/latch`, takes several locks without deadlocking, and the pool gains
+**mini-transactions**: several page changes that all happen or none do.
+
+In short: short-lived *latches* guard bytes in memory, every lock is taken in one
+global order so no deadlock can form, the page table is split into stripes, and a
+B+Tree split is one all-or-nothing mini-transaction.
+
+**Latches and locks.** Databases use two words for two jobs.
+
+- A **latch** guards bytes in memory for a moment, such as one page while it is
+  read or changed. It is held for microseconds and always taken in a fixed order,
+  so it needs no deadlock detector. Each frame has one `sync.RWMutex` (many
+  readers or one writer), reached only through the pool (`pool.RLatch(f)`,
+  `pool.WLatch(f)`) or a mini-transaction, so `0x14` can hook the write latch.
+- A **lock** guards a logical thing, such as a row, for a whole transaction. It
+  can be held for seconds, deadlocks are normal, and a detector breaks them.
+  Locks arrive in `0x18`.
+
+Postgres calls its latches LWLocks and its locks heavyweight locks; InnoDB has
+rw-latches and record locks.
+
+**Lock granularity.** A lock can cover a lot or a little. Coarse is simple and
+takes few locks. Fine lets more goroutines work at once, but takes more locks and
+gives more chances to deadlock.
+
+```
+level     guards              in ScuteDB now                          later
+database  the whole file      nothing yet                             a db gate for DDL (0x15)
+table     one tree or table   Tree.mu: readers share, writers alone   table mutex (0x10), crabbing (0x0D)
+page      one 4 KB frame      the frame latch, via pool or MTR        heap page latches (0x0F)
+row       one row or key      nothing yet                             the lock manager (0x18)
+```
+
+**Deadlock and lock order.** Goroutine A holds lock 1 and waits for lock 2;
+goroutine B holds lock 2 and waits for lock 1. Neither can move: a **deadlock**.
+`make demo-latch` builds exactly this with `latch.Mutex`, a mutex that can give
+up when a channel closes, so a watchdog can break what a `sync.Mutex` would keep
+forever:
+
+```
+after 500ms neither has finished: each waits for the lock the other holds.
+A gave up and let go of its first lock
+B gave up and let go of its first lock
+```
+
+A cycle of waits needs someone to take locks against the order. If everyone
+takes locks in one agreed order, no cycle can form. `latch.LockInOrder` sorts a
+set of locks by id first: with A listing (1, 2) and B listing (2, 1), DEMO_ORDERED
+with no deadlock. ScuteDB's **global lock order**, which every step follows:
+
+```
+db gate
+ -> catalog / table mutex
+ -> tree latches (top-down, left to right)
+ -> heap mutex
+ -> heap page latches (one at a time, or by ascending page id)
+ -> pool stripe
+ -> pagestore mutex
+ -> WAL mutex
+```
+
+Never enter a tree while holding a heap latch, or the reverse. Never wait in the
+lock manager while holding any latch, pin or mutex: lock first, then latch, read,
+and check again. Inside the pool, a stripe comes before the replacer mutex, and
+no pool lock is held while a page is read or written or while waiting for a latch.
+
+**Striping.** With one mutex around the page table, every `Fetch` waits in one
+queue. **Lock striping** splits the table into N small maps, each with its own
+lock, chosen by a hash of the page id (multiply by `0x9E3779B97F4A7C15`, keep the
+top bits). Two goroutines that want different pages usually take different
+locks. Each stripe is padded to its own 64-byte cache line, so two stripes never
+share one (*false sharing* would make CPUs fight over a line neither needs).
+`make demo-latch`, 10-CPU laptop, best of three, millions of operations a second:
+
+```
+DEMO_TABLE
+```
+
+The page table alone gains DEMO_GAIN. The whole pool barely moves: every `Fetch`
+and `Unpin` also takes the one replacer mutex (LRU order and pin counts), so
+striping only moved the queue there. Postgres splits its buffer table into 128
+partitions too, then avoids a global replacer with clock-sweep and an atomic pin
+count in each buffer header.
+
+**How the pool stays right.** A frame is `free`, `loading`, `ready` or `in
+transit`.
+
+- A page being read is in the page table, marked *loading*. A second `Fetch`
+  waits for that one read, so nobody sees a half-loaded frame.
+- A dirty victim stays in the page table, marked *in transit*, until its write
+  finishes. A `Fetch` of it waits, then reads the new bytes; if the page left the
+  table first, that `Fetch` would read the old bytes from the file.
+- `Fetch` never waits for a free frame. If every frame is pinned or in transit,
+  it returns `ErrNoFreeFrame` at once.
+- `Flush` holds the page's read latch while it copies and writes it, and clears
+  *dirty* under that same latch, so no change slips in between.
+- An evictor that picked a victim checks again under the stripe lock, because a
+  reader may have pinned it a moment before.
+
+Each rule has a test that blocks a fake disk on a channel and watches the pool
+through a hook, with no sleeps.
+
+**Mini-transactions.** A split changes up to `2 x height + 1` pages: each node on
+the way up, a new right sibling for each, and two new pages when the root splits.
+Any subset of those changes is a broken tree, so a split is one
+**mini-transaction** (*MTR*), the idea InnoDB calls `mtr`:
+
+```go
+m := pool.Begin()
+f, err := m.Fetch(id)    // pin; m.NewPage(kind) pins a new page
+err = m.WLatch(f)        // write latch, plus a copy of the page: the before-image
+...                      // change f.Page()
+err = m.Commit()         // mark changed pages dirty, unlatch, unpin
+err = m.Abort()          // or: put every before-image back, free the new pages
+```
+
+`m.Release(f)` lets go of a page early, but refuses one this MTR changed.
+`m.Free(id)` frees at commit. `m.SetUndo(txn, prevLSN, payload)` keeps an undo
+record for `0x15`. `Put`, `Delete` and `Create` make their own MTR; `PutMTR`,
+`DeleteMTR` and `CreateMTR` take the caller's, so later steps keep these
+signatures. A split plans with one read latch at a time, write-latches every page
+it will change top-down, allocates its new pages, and only then writes. Any
+failed read, write or allocation aborts it and leaves the tree exactly as it was;
+a test cuts a split short at every disk call it makes (2, 2, 4 and 7 calls in
+four kinds of split). This replaces `0x0B`'s "finish it at the next change". The
+price: a writer needs `disktree.MinFrames(height)` = `2 x height + 1` free frames.
+
+In `0x14`, `Commit` will append **one** log record (the undo payload, a full page
+image or byte diff per changed page, the allocations) and set each page's LSN
+before it unlatches. Recovery replays whole MTRs, so no crash leaves half a split.
+
+**The tree and the store.** Each tree has one `sync.RWMutex`: `Get`, `Validate`
+and scan refills share it; `Put` and `Delete` hold it alone until their MTR
+commits. A scan holds no lock, latch or pin between `Next` calls: it copies one
+leaf and finds its place again by its last key. `0x0D` replaces the tree lock
+with latch crabbing. `pagestore` puts one mutex around every method.
+
+**What the race detector does and does not prove.** `go test -race` watches every
+memory access and every lock while tests run. It reports two goroutines touching
+the same memory, at least one writing, with nothing ordering them. Every test
+passes under it, including a pool stress test (8 goroutines, pages holding a
+pattern and a counter, MTR transfers that must keep a total) and a tree stress
+test (8 writers on their own key ranges, 4 readers running `Validate` and scans;
+the final tree must equal the writers' models exactly).
+
+It does **not** prove the code right. It sees only code that ran, in the orders
+that happened. It never reports a deadlock; the opposite-order test needs its own
+watchdog. And it misses races in logic: steps that each take a lock but should
+have been one step. Two planted bugs show this. One let a dirty victim leave the
+page table before its write finished; the other let `Put` share the tree lock.
+Under `-race` both gave **zero** race reports, because every byte was still
+touched under some latch. The stress tests caught them anyway: a page counter
+behind by one ("163 after 164 increments: an update was lost") and a leaf chain
+`Validate` rejected. A third plant, `pagestore.Allocate` without its mutex, is a
+plain data race: 33 reports. The detector also costs time: TIMING.
+
+**How strong are the tests?** COVERAGE. PLANTED. MUTANTS. FUZZ.
+
+**Known limits**, each deliberate:
+
+- One lock per tree: writers to one tree go one at a time until `0x0D`.
+- The replacer mutex is global, so pool hits stop scaling past two goroutines.
+- `pagestore` holds its mutex while it reads or writes the file.
+- MTRs log nothing yet (`0x14`). The file is consistent only after a clean
+  `FlushAll` and checkpoint.
+- `Fetch` fails rather than waits when every frame is pinned, so a pool must be
+  sized for its busiest moment.
+
+Run it: `make demo-latch`.
 
 ---
 
@@ -1356,8 +1523,9 @@ internal/
   btree/            in-memory B+Tree: search, insert, split, range scans, delete
   nodepage/         the on-disk byte layout of a B+Tree node
   pagestore/        page allocation, free list, meta page, checkpoints
-  bufpool/          buffer pool: frames, pins, dirty pages, LRU / Clock / LRU-K
+  bufpool/          buffer pool: frames, pins, latches, mini-transactions, LRU / Clock / LRU-K
   disktree/         the B+Tree on disk: nodepage pages reached through the pool
+  latch/            lock striping, ordered locking, a cancellable mutex
 ```
 
 ## Conventions

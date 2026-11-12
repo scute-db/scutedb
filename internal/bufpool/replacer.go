@@ -31,7 +31,6 @@ func (t *tracking) track(f int) bool {
 		return false
 	}
 	t.tracked[f] = true
-	t.evictable[f] = false
 	return true
 }
 
@@ -152,10 +151,10 @@ func (r *clock) Evict() (int, bool) {
 		return 0, false
 	}
 	n := len(r.tracked)
-	for step := 0; step < 2*n+1; step++ {
+	for step := 0; step < 2*n; step++ {
 		f := r.hand
 		r.hand = (r.hand + 1) % n
-		if !r.tracked[f] || !r.evictable[f] {
+		if !r.evictable[f] {
 			continue
 		}
 		if r.ref[f] {
@@ -173,7 +172,6 @@ func (r *clock) Remove(f int) {
 		return
 	}
 	r.untrack(f)
-	r.ref[f] = false
 }
 
 type lruK struct {
@@ -226,7 +224,7 @@ func (r *lruK) Evict() (int, bool) {
 	victimInf := false
 	var victimTime uint64
 	for f := range r.tracked {
-		if !r.tracked[f] || !r.evictable[f] {
+		if !r.evictable[f] {
 			continue
 		}
 		inf := r.seen[f] < r.k
@@ -242,7 +240,6 @@ func (r *lruK) Evict() (int, bool) {
 		return 0, false
 	}
 	r.untrack(victim)
-	r.seen[victim] = 0
 	return victim, true
 }
 
@@ -251,5 +248,4 @@ func (r *lruK) Remove(f int) {
 		return
 	}
 	r.untrack(f)
-	r.seen[f] = 0
 }

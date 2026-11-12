@@ -27,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range|delete|nodepage|pagestore|bufpool")
+		fmt.Println("usage: scutedb-demo scan|update|race|crash|pages|header|encode|nulls|align|btree|range|delete|nodepage|pagestore|bufpool|latch")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -61,6 +61,8 @@ func main() {
 		expPageStore()
 	case "bufpool":
 		expBufPool()
+	case "latch":
+		expLatch()
 	case "store-child":
 		storeChild(os.Args[2])
 	case "crash-child":
