@@ -136,6 +136,9 @@ func (n Node) EntrySize(keyLen int) int { return SlotSize + keyLen + n.suffixLen
 func (n Node) Fits(keyLen int) bool { return n.EntrySize(keyLen) <= n.FreeSpace() }
 
 func (n Node) appendCell(key []byte, tail []byte) error {
+	if err := CheckKey(key); err != nil {
+		return err
+	}
 	need := SlotSize + len(key) + len(tail)
 	if need > n.FreeSpace() {
 		return fmt.Errorf("%w: needs %d bytes, %d free", ErrNoFit, need, n.FreeSpace())
@@ -182,9 +185,12 @@ func (n Node) Search(key []byte) (int, bool) {
 	return i, false
 }
 
+func (n Node) ChildIndex(key []byte) int {
+	return sort.Search(n.KeyCount(), func(i int) bool { return bytes.Compare(key, n.KeyRef(i)) < 0 })
+}
+
 func (n Node) ChildFor(key []byte) core.PageID {
-	i := sort.Search(n.KeyCount(), func(i int) bool { return bytes.Compare(key, n.KeyRef(i)) < 0 })
-	return n.Child(i)
+	return n.Child(n.ChildIndex(key))
 }
 
 func MaxKeys(kind page.Kind, keyLen int) int {

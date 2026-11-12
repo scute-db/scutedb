@@ -55,6 +55,10 @@ fuzz:
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzValueRoundTrip -fuzztime=30s
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzKeyOrderingInt64 -fuzztime=30s
 	go test ./internal/codec/ -run=XXX -fuzz=FuzzDecoderNeverPanics -fuzztime=30s
+	go test ./internal/nodepage/ -run=XXX -fuzz=FuzzEditsKeepTheNodeValid -fuzztime=30s
+	go test ./internal/bufpool/ -run=XXX -fuzz=FuzzPoolAgreesWithAModel -fuzztime=30s
+	go test ./internal/disktree/ -run=XXX -fuzz=FuzzTreeMatchesAMap -fuzztime=30s
+	go test ./internal/disktree/ -run=XXX -fuzz=FuzzCorruptPagesNeverPanic -fuzztime=30s
 
 demo-nulls:
 	go run ./cmd/scutedb-demo nulls
@@ -76,3 +80,6 @@ demo-nodepage:
 
 demo-pagestore:
 	go build -o /tmp/scutedb-demo ./cmd/scutedb-demo && /tmp/scutedb-demo pagestore
+
+demo-bufpool:
+	go run ./cmd/scutedb-demo bufpool
