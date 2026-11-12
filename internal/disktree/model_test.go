@@ -1,6 +1,7 @@
 package disktree
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -10,10 +11,19 @@ import (
 )
 
 type treeDriver struct {
-	t     testing.TB
-	tr    *Tree
-	model map[string]core.RowID
-	keys  []string
+	t         testing.TB
+	tr        *Tree
+	model     map[string]core.RowID
+	keys      []string
+	smallPool bool
+}
+
+func (d *treeDriver) refusedForSpace(err error) bool {
+	if !d.smallPool || !errors.Is(err, bufpool.ErrNoFreeFrame) {
+		return false
+	}
+	h, herr := d.tr.Height()
+	return herr == nil && d.tr.Pool().Frames() < MinFrames(h)
 }
 
 func (d *treeDriver) remember(k string) {
@@ -34,6 +44,9 @@ func (d *treeDriver) do(op int, key, bound []byte, rid core.RowID) {
 	switch op % 6 {
 	case 0, 1:
 		if err := tr.Put(key, rid); err != nil {
+			if d.refusedForSpace(err) {
+				break
+			}
 			t.Fatalf("Put(% 02X): %v", key, err)
 		}
 		d.remember(string(key))

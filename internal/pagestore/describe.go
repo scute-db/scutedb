@@ -9,6 +9,8 @@ import (
 )
 
 func (s *Store) DescribeMeta() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return "", err
 	}
@@ -101,6 +103,8 @@ func joinIDs(ids []core.PageID) string {
 }
 
 func (s *Store) DescribeFreeList() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var b strings.Builder
 	fmt.Fprintf(&b, "%-26s %s\n", "reusable now", joinIDs(s.free))
 	fmt.Fprintf(&b, "%-26s %s\n", "pending, after checkpoint", joinIDs(s.pending))
@@ -109,6 +113,8 @@ func (s *Store) DescribeFreeList() string {
 }
 
 func (s *Store) Describe() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var b strings.Builder
 	used := int(s.nextPage) - 1 - len(s.free) - len(s.pending) - len(s.listPage)
 	fmt.Fprintf(&b, "%-28s %d pages, %d bytes\n", "file holds", s.filePages, int(s.filePages)*page.Size)

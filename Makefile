@@ -59,6 +59,7 @@ fuzz:
 	go test ./internal/bufpool/ -run=XXX -fuzz=FuzzPoolAgreesWithAModel -fuzztime=30s
 	go test ./internal/disktree/ -run=XXX -fuzz=FuzzTreeMatchesAMap -fuzztime=30s
 	go test ./internal/disktree/ -run=XXX -fuzz=FuzzCorruptPagesNeverPanic -fuzztime=30s
+	go test ./internal/bufpool/ -run=XXX -fuzz=FuzzMiniTransactionsAgreeWithAModel -fuzztime=30s
 
 demo-nulls:
 	go run ./cmd/scutedb-demo nulls
@@ -83,3 +84,6 @@ demo-pagestore:
 
 demo-bufpool:
 	go run ./cmd/scutedb-demo bufpool
+
+demo-latch:
+	go run ./cmd/scutedb-demo latch

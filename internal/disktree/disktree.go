@@ -3,6 +3,7 @@ package disktree
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/scute-db/scutedb/internal/bufpool"
 	"github.com/scute-db/scutedb/internal/core"
@@ -11,31 +12,56 @@ import (
 )
 
 var (
-	ErrCorrupt = errors.New("scutedb/disktree: tree is corrupt")
-	ErrNoPool  = errors.New("scutedb/disktree: no buffer pool")
+	ErrCorrupt   = errors.New("scutedb/disktree: tree is corrupt")
+	ErrNoPool    = errors.New("scutedb/disktree: no buffer pool")
+	ErrNoMTR     = errors.New("scutedb/disktree: no mini-transaction")
+	ErrOtherPool = errors.New("scutedb/disktree: the mini-transaction belongs to another buffer pool")
 )
 
 type Tree struct {
-	pool    *bufpool.Pool
-	root    core.PageID
-	pending []write
+	mu    sync.RWMutex
+	pool  *bufpool.Pool
+	root  core.PageID
+	pause func(stage string)
+}
+
+func MinFrames(height int) int {
+	if height < 1 {
+		height = 1
+	}
+	return 2*height + 1
 }
 
 func Create(pool *bufpool.Pool) (*Tree, core.PageID, error) {
 	if pool == nil {
 		return nil, 0, ErrNoPool
 	}
-	f, err := pool.NewPage(page.KindBTreeLeaf)
+	m := pool.Begin()
+	t, id, err := CreateMTR(m)
 	if err != nil {
+		return nil, 0, fmt.Errorf("scutedb/disktree: create: %w", abort(m, err))
+	}
+	if err := m.Commit(); err != nil {
 		return nil, 0, fmt.Errorf("scutedb/disktree: create: %w", err)
+	}
+	return t, id, nil
+}
+
+func CreateMTR(m *bufpool.MTR) (*Tree, core.PageID, error) {
+	if m == nil {
+		return nil, 0, ErrNoMTR
+	}
+	f, err := m.NewPage(page.KindBTreeLeaf)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := m.WLatch(f); err != nil {
+		return nil, 0, err
 	}
 	id := f.ID()
 	copy(f.Page(), nodepage.NewLeaf(id).Page)
 	f.MarkVerified()
-	if err := pool.Unpin(f, true); err != nil {
-		return nil, 0, fmt.Errorf("scutedb/disktree: create: %w", err)
-	}
-	return &Tree{pool: pool, root: id}, id, nil
+	return &Tree{pool: m.Pool(), root: id}, id, nil
 }
 
 func Open(pool *bufpool.Pool, root core.PageID) (*Tree, error) {
@@ -43,11 +69,11 @@ func Open(pool *bufpool.Pool, root core.PageID) (*Tree, error) {
 		return nil, ErrNoPool
 	}
 	t := &Tree{pool: pool, root: root}
-	f, _, err := t.fetch(root)
+	v, err := t.read(nil, root)
 	if err != nil {
 		return nil, fmt.Errorf("scutedb/disktree: open root %d: %w", root, err)
 	}
-	if err := t.unpin(f, false, nil); err != nil {
+	if err := t.release(v, nil); err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -55,6 +81,29 @@ func Open(pool *bufpool.Pool, root core.PageID) (*Tree, error) {
 
 func (t *Tree) Root() core.PageID   { return t.root }
 func (t *Tree) Pool() *bufpool.Pool { return t.pool }
+
+func abort(m *bufpool.MTR, err error) error {
+	if aerr := m.Abort(); aerr != nil {
+		return errors.Join(err, aerr)
+	}
+	return err
+}
+
+func (t *Tree) at(stage string) {
+	if t.pause != nil {
+		t.pause(stage)
+	}
+}
+
+func (t *Tree) owns(m *bufpool.MTR) error {
+	if m == nil {
+		return ErrNoMTR
+	}
+	if m.Pool() != t.pool {
+		return ErrOtherPool
+	}
+	return nil
+}
 
 func (t *Tree) unpin(f *bufpool.Frame, dirty bool, err error) error {
 	if uerr := t.pool.Unpin(f, dirty); uerr != nil {
@@ -66,11 +115,34 @@ func (t *Tree) unpin(f *bufpool.Frame, dirty bool, err error) error {
 	return err
 }
 
-func (t *Tree) fetch(id core.PageID) (*bufpool.Frame, nodepage.Node, error) {
+type view struct {
+	f   *bufpool.Frame
+	n   nodepage.Node
+	own bool
+}
+
+func (t *Tree) read(m *bufpool.MTR, id core.PageID) (view, error) {
+	if m != nil && m.Holds(id) {
+		f, err := m.Fetch(id)
+		if err != nil {
+			return view{}, err
+		}
+		n, err := check(f, id)
+		return view{f: f, n: n}, err
+	}
 	f, err := t.pool.Fetch(id)
 	if err != nil {
-		return nil, nodepage.Node{}, err
+		return view{}, err
 	}
+	t.pool.RLatch(f)
+	v := view{f: f, own: true}
+	if v.n, err = check(f, id); err != nil {
+		return view{}, t.release(v, err)
+	}
+	return v, nil
+}
+
+func check(f *bufpool.Frame, id core.PageID) (nodepage.Node, error) {
 	n, err := nodepage.Load(f.Page())
 	if err == nil && !f.Verified() {
 		if err = n.Validate(); err == nil {
@@ -78,9 +150,17 @@ func (t *Tree) fetch(id core.PageID) (*bufpool.Frame, nodepage.Node, error) {
 		}
 	}
 	if err != nil {
-		return nil, nodepage.Node{}, t.unpin(f, false, fmt.Errorf("%w: page %d: %w", ErrCorrupt, id, err))
+		return nodepage.Node{}, fmt.Errorf("%w: page %d: %w", ErrCorrupt, id, err)
 	}
-	return f, n, nil
+	return n, nil
+}
+
+func (t *Tree) release(v view, err error) error {
+	if !v.own {
+		return err
+	}
+	t.pool.RUnlatch(v.f)
+	return t.unpin(v.f, false, err)
 }
 
 type step struct {
@@ -88,94 +168,165 @@ type step struct {
 	index int
 }
 
-func (t *Tree) descend(key []byte, path *[]step) (*bufpool.Frame, nodepage.Node, error) {
-	f, n, err := t.fetch(t.root)
+func (t *Tree) descend(m *bufpool.MTR, key []byte, path *[]step) (core.PageID, view, error) {
+	id := t.root
+	v, err := t.read(m, id)
 	if err != nil {
-		return nil, nodepage.Node{}, err
+		return 0, view{}, err
 	}
-	for !n.Leaf() {
-		i := n.ChildIndex(key)
-		child, level := n.Child(i), n.Level()
+	for !v.n.Leaf() {
+		i := v.n.ChildIndex(key)
+		child, level := v.n.Child(i), v.n.Level()
 		if path != nil {
-			*path = append(*path, step{id: f.ID(), index: i})
+			*path = append(*path, step{id: id, index: i})
 		}
-		if err := t.unpin(f, false, nil); err != nil {
-			return nil, nodepage.Node{}, err
+		if err := t.release(v, nil); err != nil {
+			return 0, view{}, err
 		}
-		if f, n, err = t.fetch(child); err != nil {
-			return nil, nodepage.Node{}, err
+		id = child
+		if v, err = t.read(m, id); err != nil {
+			return 0, view{}, err
 		}
-		if n.Level() != level-1 {
-			return nil, nodepage.Node{}, t.unpin(f, false, fmt.Errorf("%w: page %d is at level %d under a level-%d node",
-				ErrCorrupt, child, n.Level(), level))
+		if v.n.Level() != level-1 {
+			return 0, view{}, t.release(v, fmt.Errorf("%w: page %d is at level %d under a level-%d node",
+				ErrCorrupt, id, v.n.Level(), level))
 		}
 	}
-	return f, n, nil
+	return id, v, nil
 }
 
 func (t *Tree) Get(key []byte) (core.RowID, bool, error) {
-	f, n, err := t.descend(key, nil)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, v, err := t.descend(nil, key, nil)
 	if err != nil {
 		return core.RowID{}, false, err
 	}
 	var rid core.RowID
-	i, found := n.Search(key)
+	i, found := v.n.Search(key)
 	if found {
-		rid = n.Row(i)
+		rid = v.n.Row(i)
 	}
-	return rid, found, t.unpin(f, false, nil)
+	return rid, found, t.release(v, nil)
 }
 
 func (t *Tree) Put(key []byte, rid core.RowID) error {
 	if err := nodepage.CheckKey(key); err != nil {
 		return fmt.Errorf("scutedb/disktree: put: %w", err)
 	}
-	if err := t.resume(); err != nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m := t.pool.Begin()
+	if err := t.put(m, key, rid); err != nil {
+		return abort(m, err)
+	}
+	return m.Commit()
+}
+
+func (t *Tree) PutMTR(m *bufpool.MTR, key []byte, rid core.RowID) error {
+	if err := nodepage.CheckKey(key); err != nil {
+		return fmt.Errorf("scutedb/disktree: put: %w", err)
+	}
+	if err := t.owns(m); err != nil {
 		return err
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.put(m, key, rid)
+}
+
+func (t *Tree) leaf(m *bufpool.MTR, key []byte, path *[]step) (*bufpool.Frame, nodepage.Node, bool, error) {
+	id, v, err := t.descend(m, key, path)
+	if err != nil {
+		return nil, nodepage.Node{}, false, err
+	}
+	if err := t.release(v, nil); err != nil {
+		return nil, nodepage.Node{}, false, err
+	}
+	t.at("leaf")
+	held := m.Holds(id)
+	f, err := m.Fetch(id)
+	if err != nil {
+		return nil, nodepage.Node{}, false, err
+	}
+	if err := m.WLatch(f); err != nil {
+		return nil, nodepage.Node{}, false, err
+	}
+	n, err := check(f, id)
+	if err == nil && !n.Leaf() {
+		err = fmt.Errorf("%w: page %d stopped being a leaf", ErrCorrupt, id)
+	}
+	return f, n, held, err
+}
+
+func (t *Tree) put(m *bufpool.MTR, key []byte, rid core.RowID) error {
 	var path []step
-	f, n, err := t.descend(key, &path)
+	f, n, held, err := t.leaf(m, key, &path)
 	if err != nil {
 		return err
 	}
 	i, found := n.Search(key)
 	if found {
-		err := n.SetRow(i, rid)
-		return t.unpin(f, err == nil, err)
+		return n.SetRow(i, rid)
 	}
 	if n.Fits(len(key)) {
-		err := n.InsertLeaf(i, key, rid)
-		return t.unpin(f, err == nil, err)
+		return n.InsertLeaf(i, key, rid)
 	}
 	full := readImage(n)
 	full.insert(i, entry{key: append([]byte(nil), key...), rid: rid})
-	if err := t.unpin(f, false, nil); err != nil {
-		return err
+	if !held {
+		if err := m.Release(f); err != nil {
+			return err
+		}
 	}
-	return t.split(path, full)
+	return t.split(m, path, full)
 }
 
 func (t *Tree) Delete(key []byte) (bool, error) {
-	if err := t.resume(); err != nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m := t.pool.Begin()
+	ok, err := t.delete(m, key)
+	if err != nil {
+		return false, abort(m, err)
+	}
+	return ok, m.Commit()
+}
+
+func (t *Tree) DeleteMTR(m *bufpool.MTR, key []byte) (bool, error) {
+	if err := t.owns(m); err != nil {
 		return false, err
 	}
-	f, n, err := t.descend(key, nil)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.delete(m, key)
+}
+
+func (t *Tree) delete(m *bufpool.MTR, key []byte) (bool, error) {
+	f, n, held, err := t.leaf(m, key, nil)
 	if err != nil {
 		return false, err
 	}
 	i, found := n.Search(key)
 	if !found {
-		return false, t.unpin(f, false, nil)
+		if held {
+			return false, nil
+		}
+		return false, m.Release(f)
 	}
-	err = n.Remove(i)
-	return err == nil, t.unpin(f, err == nil, err)
+	if err := n.Remove(i); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (t *Tree) Height() (int, error) {
-	f, n, err := t.fetch(t.root)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	v, err := t.read(nil, t.root)
 	if err != nil {
 		return 0, err
 	}
-	h := int(n.Level()) + 1
-	return h, t.unpin(f, false, nil)
+	h := int(v.n.Level()) + 1
+	return h, t.release(v, nil)
 }

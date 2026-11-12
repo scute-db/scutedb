@@ -45,9 +45,46 @@ func putUntilError(tr *Tree, next func() int, limit int) (err error) {
 	return err
 }
 
+func evictRoot(t *testing.T, tr *Tree) {
+	t.Helper()
+	p := tr.Pool()
+	if err := p.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+	var held []*bufpool.Frame
+	for id := core.PageID(1); len(held) < p.Frames(); id++ {
+		if id == tr.Root() {
+			continue
+		}
+		f, err := p.Fetch(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, f)
+	}
+	for _, f := range held {
+		if err := p.Unpin(f, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.Contains(tr.Root()) {
+		t.Fatal("the root is still resident")
+	}
+}
+
+func onceAt(stage string, do func()) func(string) {
+	fired := false
+	return func(s string) {
+		if s == stage && !fired {
+			fired = true
+			do()
+		}
+	}
+}
+
 func TestASplitWhoseParentComesBackFromDiskAsAnOlderVersionDoesNotPanic(t *testing.T) {
 	src := bufpool.NewMemSource()
-	tr, _, err := Create(newPool(t, src, 2, bufpool.LRU, bufpool.WriteBack))
+	tr, _, err := Create(newPool(t, src, 3, bufpool.LRU, bufpool.WriteBack))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,18 +104,22 @@ func TestASplitWhoseParentComesBackFromDiskAsAnOlderVersionDoesNotPanic(t *testi
 			break
 		}
 	}
-	if _, _, err := tr.Get(k8(0)); err != nil {
-		t.Fatal(err)
-	}
-	if err := src.Write(old); err != nil {
-		t.Fatal(err)
-	}
+	tr.pause = onceAt("split", func() {
+		evictRoot(t, tr)
+		if err := src.Write(old); err != nil {
+			t.Fatal(err)
+		}
+	})
+	pages := src.Len()
 	putErr := putUntilError(tr, func() int { i++; return i }, 400)
 	if putErr == nil {
 		t.Fatal("no split ever read the older root back")
 	}
 	if !errors.Is(putErr, ErrCorrupt) {
 		t.Fatalf("a split under a root that went back to an older version on disk gave %v, want ErrCorrupt", putErr)
+	}
+	if src.Len() != pages {
+		t.Fatalf("the refused split leaked %d pages", src.Len()-pages)
 	}
 	noPins(t, tr, "a split whose parent changed on disk")
 }
@@ -118,7 +159,7 @@ func TestASplitRefusesAParentThatNoLongerMatchesThePathItCameDown(t *testing.T) 
 	}
 	for _, c := range cases {
 		src := bufpool.NewMemSource()
-		tr, _, err := Create(newPool(t, src, 2, bufpool.LRU, bufpool.WriteBack))
+		tr, _, err := Create(newPool(t, src, 3, bufpool.LRU, bufpool.WriteBack))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +173,10 @@ func TestASplitRefusesAParentThatNoLongerMatchesThePathItCameDown(t *testing.T) 
 			t.Fatal(err)
 		}
 		pages := src.Len()
-		rewriteRoot(t, src, tr, c.edit)
+		tr.pause = onceAt("split", func() {
+			rewriteRoot(t, src, tr, c.edit)
+			evictRoot(t, tr)
+		})
 		n := 1 << 20
 		putErr := putUntilError(tr, func() int { n++; return n }, 400)
 		if !errors.Is(putErr, ErrCorrupt) {
@@ -143,6 +187,83 @@ func TestASplitRefusesAParentThatNoLongerMatchesThePathItCameDown(t *testing.T) 
 		}
 		noPins(t, tr, c.name)
 	}
+}
+
+func TestASplitStopsWhenAPageItPlannedChangesBeforeItIsLatched(t *testing.T) {
+	for _, target := range []string{"leaf", "root"} {
+		src := bufpool.NewMemSource()
+		tr, _, err := Create(newPool(t, src, 3, bufpool.LRU, bufpool.WriteBack))
+		if err != nil {
+			t.Fatal(err)
+		}
+		model := map[string]core.RowID{}
+		for i := 0; i < 400; i++ {
+			mustPut(t, tr, k8(2*i), ridOf(i))
+			model[string(k8(2*i))] = ridOf(i)
+		}
+		var victim core.PageID
+		var failed []byte
+		tr.pause = func(stage string) {
+			if stage != "latch" || victim != 0 {
+				return
+			}
+			victim = tr.Root()
+			if target == "leaf" {
+				victim = leafOf(t, tr, failed)
+			}
+			if err := tr.Pool().FlushAll(); err != nil {
+				t.Fatal(err)
+			}
+			p, err := src.Read(victim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p[page.Size-1] ^= 0xFF
+			evictRoot(t, tr)
+			for id := core.PageID(1); tr.Pool().Contains(victim); id++ {
+				f, err := tr.Pool().Fetch(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := tr.Pool().Unpin(f, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := src.Write(p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pages := src.Len()
+		var putErr error
+		for i := 0; i < 400 && putErr == nil; i++ {
+			failed = k8(2*i + 1)
+			if putErr = tr.Put(failed, ridOf(i)); putErr == nil {
+				model[string(failed)] = ridOf(i)
+			}
+		}
+		if !errors.Is(putErr, ErrCorrupt) {
+			t.Fatalf("%s: a split whose %s changed after it was planned gave %v, want ErrCorrupt", target, target, putErr)
+		}
+		if src.Len() != pages {
+			t.Fatalf("%s: the refused split leaked %d pages", target, src.Len()-pages)
+		}
+		noPins(t, tr, "the refused split")
+		if _, ok, err := tr.Get(failed); ok {
+			t.Fatalf("%s: the refused key is present (%v)", target, err)
+		}
+	}
+}
+
+func leafOf(t *testing.T, tr *Tree, key []byte) core.PageID {
+	t.Helper()
+	id, v, err := tr.descend(nil, key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.release(v, nil); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 type flakyPageSource struct {
@@ -222,14 +343,9 @@ func TestOneFailedWriteThroughDuringASplitDoesNotLeaveTheLiveTreeHalfSplit(t *te
 	checkModel(t, again, model)
 }
 
-func failNext(src *armedSource) {
-	src.live = true
-	src.failAt = src.count + 1
-}
-
-func TestASplitCutShortByAFailedReadOrWriteIsUndoneOrFinishedByTheNextChange(t *testing.T) {
-	undone, finished := 0, 0
-	for _, frames := range []int{1, 2} {
+func TestASplitCutShortByAFailedReadOrWriteLeavesTheTreeUnchanged(t *testing.T) {
+	undone := 0
+	for _, frames := range []int{3, 4} {
 		for _, preload := range []int{200, 400} {
 			for _, writes := range []bool{false, true} {
 				for at := 1; at <= 8; at++ {
@@ -261,46 +377,26 @@ func TestASplitCutShortByAFailedReadOrWriteIsUndoneOrFinishedByTheNextChange(t *
 						model[string(k)] = ridOf(i)
 						pages = mem.Len()
 					}
-					src.armed = false
+					src.armed, src.live = false, false
 					if failed == nil {
 						continue
 					}
+					undone++
 					noPins(t, tr, "the failed Put")
-					if len(tr.pending) == 0 {
-						undone++
-						src.live = false
-						if mem.Len() != pages {
-							t.Fatalf("frames %d, preload %d, writes %v, at %d: the undone split left %d pages allocated",
-								frames, preload, writes, at, mem.Len()-pages)
-						}
-						if _, ok, err := tr.Get(failed); ok || err != nil {
-							t.Fatalf("the undone split's key is present: %v %v", ok, err)
-						}
-					} else {
-						finished++
-						refused := []struct {
-							name string
-							run  func() error
-						}{
-							{"Put", func() error { return tr.Put(k8(-1), ridOf(1)) }},
-							{"Delete", func() error { _, err := tr.Delete(k8(0)); return err }},
-							{"Validate", tr.Validate},
-							{"Close", x.Close},
-						}
-						for _, op := range refused {
-							failNext(src)
-							if err := op.run(); !errors.Is(err, errInjected) || len(tr.pending) == 0 {
-								t.Fatalf("%s while the split cannot be finished gave %v, with %d page images waiting",
-									op.name, err, len(tr.pending))
-							}
-						}
-						if _, err := tr.measure(); !errors.Is(err, ErrCorrupt) {
-							t.Fatalf("a split left waiting must have changed an old page already, yet the tree checks as %v", err)
-						}
-						noPins(t, tr, "operations refused while a split waits")
-						src.live = false
-						model[string(failed)] = failedRID
+					if mem.Len() != pages {
+						t.Fatalf("frames %d, preload %d, writes %v, at %d: the undone split left %d pages allocated",
+							frames, preload, writes, at, mem.Len()-pages)
 					}
+					if _, ok, err := tr.Get(failed); ok || err != nil {
+						t.Fatalf("the undone split's key is present: %v %v", ok, err)
+					}
+					if _, err := tr.measure(); err != nil {
+						t.Fatalf("frames %d, preload %d, writes %v, at %d: the tree is not whole after a failed split: %v",
+							frames, preload, writes, at, err)
+					}
+					checkModel(t, tr, model)
+					mustPut(t, tr, failed, failedRID)
+					model[string(failed)] = failedRID
 					s := mustValidate(t, tr)
 					if s.Pages() != mem.Len() {
 						t.Fatalf("frames %d, preload %d, writes %v, at %d: the tree owns %d pages, the source holds %d",
@@ -320,25 +416,25 @@ func TestASplitCutShortByAFailedReadOrWriteIsUndoneOrFinishedByTheNextChange(t *
 			}
 		}
 	}
-	if undone == 0 || finished == 0 {
-		t.Fatalf("%d splits were undone and %d finished later; the test must reach both", undone, finished)
+	if undone == 0 {
+		t.Fatal("no split was ever cut short; the test injected nothing")
 	}
-	t.Logf("%d failed splits were undone, %d were finished by the next change", undone, finished)
+	t.Logf("%d failed splits were undone", undone)
 }
 
-type waitingSplit struct {
+type failedSplit struct {
 	tr    *Tree
 	mem   *bufpool.MemSource
 	root  core.PageID
 	model map[string]core.RowID
 }
 
-func cutShortSplit(t *testing.T) waitingSplit {
+func cutShortSplit(t *testing.T) failedSplit {
 	t.Helper()
-	for at := 1; at <= 12; at++ {
+	for at := 1; at <= 24; at++ {
 		mem := bufpool.NewMemSource()
-		src := &armedSource{inner: mem, failAt: at}
-		tr, root, err := Create(newPool(t, src, 1, bufpool.LRU, bufpool.WriteBack))
+		src := &armedSource{inner: mem, failAt: (at + 1) / 2, failWrites: at%2 == 0}
+		tr, root, err := Create(newPool(t, src, 3, bufpool.LRU, bufpool.WriteBack))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -352,17 +448,13 @@ func cutShortSplit(t *testing.T) waitingSplit {
 			k := k8(i*2 + 1)
 			if err := tr.Put(k, ridOf(i)); err != nil {
 				src.armed, src.live = false, false
-				if len(tr.pending) == 0 {
-					break
-				}
-				model[string(k)] = ridOf(i)
-				return waitingSplit{tr: tr, mem: mem, root: root, model: model}
+				return failedSplit{tr: tr, mem: mem, root: root, model: model}
 			}
 			model[string(k)] = ridOf(i)
 		}
 	}
-	t.Fatal("no failure point left a split waiting")
-	return waitingSplit{}
+	t.Fatal("no failure point cut a split short")
+	return failedSplit{}
 }
 
 func everyThird(model map[string]core.RowID) [][]byte {
@@ -375,11 +467,11 @@ func everyThird(model map[string]core.RowID) [][]byte {
 	return out
 }
 
-func TestTheFirstChangeAfterTheDiskHealsFinishesTheWaitingSplitBeforeItsOwnWork(t *testing.T) {
+func TestTheFirstChangeAfterAFailedSplitSeesTheTreeExactlyAsItWasBefore(t *testing.T) {
 	for _, first := range []string{"Put", "Delete", "Validate", "Close"} {
 		w := cutShortSplit(t)
-		if _, err := w.tr.measure(); !errors.Is(err, ErrCorrupt) {
-			t.Fatalf("%s: the waiting split should leave the tree half split, it checks as %v", first, err)
+		if _, err := w.tr.measure(); err != nil {
+			t.Fatalf("%s: a failed split must leave the tree whole, it checks as %v", first, err)
 		}
 		switch first {
 		case "Put":
