@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/page"
@@ -15,6 +17,7 @@ var (
 	ErrModified = errors.New("scutedb/bufpool: page was changed in this mini-transaction")
 	ErrUpgrade  = errors.New("scutedb/bufpool: a read latch cannot be upgraded to a write latch")
 	ErrUndoSet  = errors.New("scutedb/bufpool: this mini-transaction already has an undo record")
+	ErrBadLock  = errors.New("scutedb/bufpool: a mini-transaction lock must be a non-nil pointer, such as &mu")
 )
 
 type Undo struct {
@@ -46,6 +49,7 @@ type MTR struct {
 	frees   []core.PageID
 	undo    Undo
 	hasUndo bool
+	locks   []sync.Locker
 	done    bool
 }
 
@@ -65,7 +69,46 @@ func (m *MTR) Holds(id core.PageID) bool {
 	return ok
 }
 
+func (m *MTR) Latched(id core.PageID) bool {
+	h, ok := m.byID[id]
+	return ok && h.mode != pinOnly
+}
+
 func (m *MTR) Held() int { return len(m.holds) }
+
+func (m *MTR) TakeLock(l sync.Locker) error {
+	if err := m.usable(); err != nil {
+		return err
+	}
+	if l == nil {
+		return ErrBadLock
+	}
+	if v := reflect.ValueOf(l); v.Kind() != reflect.Pointer || v.IsNil() {
+		return ErrBadLock
+	}
+	if m.HasLock(l) {
+		return nil
+	}
+	l.Lock()
+	m.locks = append(m.locks, l)
+	return nil
+}
+
+func (m *MTR) HasLock(l sync.Locker) bool {
+	for _, x := range m.locks {
+		if x == l {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MTR) unlock() {
+	for i := len(m.locks) - 1; i >= 0; i-- {
+		m.locks[i].Unlock()
+	}
+	m.locks = nil
+}
 
 func (m *MTR) keep(f *Frame) {
 	h := &hold{f: f}
@@ -239,6 +282,7 @@ func (m *MTR) Commit() error {
 	for _, id := range m.frees {
 		errs = append(errs, m.pool.Free(id))
 	}
+	m.unlock()
 	return errors.Join(errs...)
 }
 
@@ -251,6 +295,7 @@ func (m *MTR) Abort() error {
 	for i := len(m.allocs) - 1; i >= 0; i-- {
 		errs = append(errs, m.pool.Free(m.allocs[i]))
 	}
+	m.unlock()
 	return errors.Join(errs...)
 }
 

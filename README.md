@@ -1452,14 +1452,18 @@ err = m.Abort()          // or: put every before-image back, free the new pages
 
 `m.Release(f)` lets go of a page early, but refuses one this MTR changed.
 `m.Free(id)` frees at commit. `m.SetUndo(txn, prevLSN, payload)` keeps an undo
-record for `0x15`. `Put`, `Delete` and `Create` make their own MTR; `PutMTR`,
-`DeleteMTR` and `CreateMTR` take the caller's, so later steps keep these
-signatures. A split plans with one read latch at a time, write-latches every page
-it will change top-down, allocates its new pages, and only then writes. Any
-failed read, write or allocation aborts it and leaves the tree exactly as it was;
-a test cuts a split short at every disk call it makes (2, 2, 4 and 7 calls in
-four kinds of split). This replaces `0x0B`'s "finish it at the next change". The
-price: a writer needs `disktree.MinFrames(height)` = `2 x height + 1` free frames.
+record for `0x15`. `m.TakeLock(l)` takes a coarser lock, such as a tree's mutex,
+once per MTR and keeps it until `Commit` or `Abort`, which let go of it only
+after every latch and pin. The lock must be a non-nil pointer such as `&mu`,
+so the MTR can tell locks apart with `==`; anything else gets `ErrBadLock`. `Put`, `Delete` and `Create` make their own MTR;
+`PutMTR`, `DeleteMTR` and `CreateMTR` take the caller's, so later steps keep
+these signatures. A split plans with one read latch at a time, write-latches
+every page it will change top-down, allocates its new pages, and only then
+writes. Any failed read, write or allocation aborts it and leaves the tree
+exactly as it was; a test cuts a split short at every disk call it makes (2, 2,
+4 and 7 calls in four kinds of split). This replaces `0x0B`'s "finish it at the
+next change". The price: a writer needs `disktree.MinFrames(height)` =
+`2 x height + 1` free frames.
 
 In `0x14`, `Commit` will append **one** log record (the undo payload, a full page
 image or byte diff per changed page, the allocations) and set each page's LSN
@@ -1467,17 +1471,29 @@ before it unlatches. Recovery replays whole MTRs, so no crash leaves half a spli
 
 **The tree and the store.** Each tree has one `sync.RWMutex`: `Get`, `Validate`
 and scan refills share it; `Put` and `Delete` hold it alone until their MTR
-commits. A scan holds no lock, latch or pin between `Next` calls: it copies one
-leaf and finds its place again by its last key. `0x0D` replaces the tree lock
-with latch crabbing. `pagestore` puts one mutex around every method.
+commits. `PutMTR`, `DeleteMTR` and `CreateMTR` give it to the caller's MTR with
+`m.TakeLock`, so it stays taken until that MTR commits or aborts, even across
+several calls. It must: the MTR keeps its write latches between calls, so if the
+lock were let go after each call, a `Get` could take the lock, wait for one of
+those latches, and leave the MTR's next call waiting for the lock forever. The
+order stays tree lock first, page latches second. Two more rules follow: a tree
+operation reads a page its MTR has only pinned under that page's read latch,
+like any other page, and a goroutine with an open MTR must not touch that tree
+outside it (`Get`, `Scan`, `Validate`, `Put`, `Delete` or a second MTR), which
+would wait for the lock it holds. A scan holds no lock, latch or pin between
+`Next` calls: it copies one leaf and finds its place again by its last key.
+`0x0D` replaces the tree lock with latch crabbing. `pagestore` puts one mutex
+around every method.
 
 **What the race detector does and does not prove.** `go test -race` watches every
 memory access and every lock while tests run. It reports two goroutines touching
 the same memory, at least one writing, with nothing ordering them. Every test
 passes under it, including a pool stress test (8 goroutines, pages holding a
-pattern and a counter, MTR transfers that must keep a total) and a tree stress
-test (8 writers on their own key ranges, 4 readers running `Validate` and scans;
-the final tree must equal the writers' models exactly).
+pattern and a counter, MTR transfers that must keep a total) and two tree stress
+tests: 8 writers on their own key ranges beside 4 readers running `Validate` and
+scans, and 4 writers that change 2 or 3 keys in each MTR, then commit or abort,
+beside 3 readers through a 20-frame pool. Each final tree must equal the
+writers' models exactly.
 
 It does **not** prove the code right. It sees only code that ran, in the orders
 that happened. It never reports a deadlock; the opposite-order test needs its own
@@ -1494,7 +1510,10 @@ plain data race: 33 reports. The detector also costs time: TIMING.
 
 **Known limits**, each deliberate:
 
-- One lock per tree: writers to one tree go one at a time until `0x0D`.
+- One lock per tree: writers to one tree go one at a time until `0x0D`, and an
+  MTR that changes a tree keeps the whole tree to itself until it ends. An MTR
+  that changes two trees takes their locks in the order it touches them, so
+  callers must touch trees in one agreed order.
 - The replacer mutex is global, so pool hits stop scaling past two goroutines.
 - `pagestore` holds its mutex while it reads or writes the file.
 - MTRs log nothing yet (`0x14`). The file is consistent only after a clean

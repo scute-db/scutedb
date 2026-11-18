@@ -51,6 +51,10 @@ func CreateMTR(m *bufpool.MTR) (*Tree, core.PageID, error) {
 	if m == nil {
 		return nil, 0, ErrNoMTR
 	}
+	t := &Tree{pool: m.Pool()}
+	if err := m.TakeLock(&t.mu); err != nil {
+		return nil, 0, err
+	}
 	f, err := m.NewPage(page.KindBTreeLeaf)
 	if err != nil {
 		return nil, 0, err
@@ -58,10 +62,10 @@ func CreateMTR(m *bufpool.MTR) (*Tree, core.PageID, error) {
 	if err := m.WLatch(f); err != nil {
 		return nil, 0, err
 	}
-	id := f.ID()
-	copy(f.Page(), nodepage.NewLeaf(id).Page)
+	t.root = f.ID()
+	copy(f.Page(), nodepage.NewLeaf(t.root).Page)
 	f.MarkVerified()
-	return &Tree{pool: m.Pool(), root: id}, id, nil
+	return t, t.root, nil
 }
 
 func Open(pool *bufpool.Pool, root core.PageID) (*Tree, error) {
@@ -122,7 +126,7 @@ type view struct {
 }
 
 func (t *Tree) read(m *bufpool.MTR, id core.PageID) (view, error) {
-	if m != nil && m.Holds(id) {
+	if m != nil && m.Latched(id) {
 		f, err := m.Fetch(id)
 		if err != nil {
 			return view{}, err
@@ -230,8 +234,9 @@ func (t *Tree) PutMTR(m *bufpool.MTR, key []byte, rid core.RowID) error {
 	if err := t.owns(m); err != nil {
 		return err
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := m.TakeLock(&t.mu); err != nil {
+		return err
+	}
 	return t.put(m, key, rid)
 }
 
@@ -297,8 +302,9 @@ func (t *Tree) DeleteMTR(m *bufpool.MTR, key []byte) (bool, error) {
 	if err := t.owns(m); err != nil {
 		return false, err
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := m.TakeLock(&t.mu); err != nil {
+		return false, err
+	}
 	return t.delete(m, key)
 }
 
