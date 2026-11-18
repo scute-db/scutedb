@@ -23,7 +23,7 @@ func FuzzTreeMatchesAMap(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := &treeDriver{t: t, tr: tr, model: map[string]core.RowID{}}
+		d := &treeDriver{t: t, tr: tr, model: map[string]core.RowID{}, smallPool: true}
 		for pos := 1; pos+2 < len(script); {
 			op, flags, size := int(script[pos]), script[pos+1], int(script[pos+2])%16+1
 			pos += 3

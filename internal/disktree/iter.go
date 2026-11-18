@@ -55,32 +55,34 @@ func (it *Iterator) Next() bool {
 }
 
 func (it *Iterator) refill() error {
+	it.t.mu.RLock()
+	defer it.t.mu.RUnlock()
 	it.keys, it.rows, it.pos = it.keys[:0], it.rows[:0], 0
 	seek, after := it.from, false
 	if it.last != nil {
 		seek, after = it.last, true
 	}
-	f, n, err := it.t.descend(seek, nil)
+	id, v, err := it.t.descend(nil, seek, nil)
 	if err != nil {
 		return err
 	}
-	seen := map[core.PageID]bool{f.ID(): true}
+	seen := map[core.PageID]bool{id: true}
 	for {
-		i, found := n.Search(seek)
+		i, found := v.n.Search(seek)
 		if found && after {
 			i++
 		}
-		for ; i < n.KeyCount(); i++ {
-			k := n.KeyRef(i)
+		for ; i < v.n.KeyCount(); i++ {
+			k := v.n.KeyRef(i)
 			if it.to != nil && bytes.Compare(k, it.to) >= 0 {
 				it.exhausted = true
 				break
 			}
 			it.keys = append(it.keys, append([]byte(nil), k...))
-			it.rows = append(it.rows, n.Row(i))
+			it.rows = append(it.rows, v.n.Row(i))
 		}
-		next := n.Next()
-		if err := it.t.unpin(f, false, nil); err != nil {
+		next := v.n.Next()
+		if err := it.t.release(v, nil); err != nil {
 			return err
 		}
 		if next == 0 {
@@ -93,11 +95,11 @@ func (it *Iterator) refill() error {
 			return fmt.Errorf("%w: the leaf chain loops back to page %d", ErrCorrupt, next)
 		}
 		seen[next] = true
-		if f, n, err = it.t.fetch(next); err != nil {
+		if v, err = it.t.read(nil, next); err != nil {
 			return err
 		}
-		if !n.Leaf() {
-			return it.t.unpin(f, false, fmt.Errorf("%w: leaf chain reaches page %d, which is not a leaf", ErrCorrupt, next))
+		if !v.n.Leaf() {
+			return it.t.release(v, fmt.Errorf("%w: leaf chain reaches page %d, which is not a leaf", ErrCorrupt, next))
 		}
 	}
 }

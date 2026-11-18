@@ -214,7 +214,7 @@ func (s *armedSource) Free(id core.PageID) error { return s.inner.Free(id) }
 
 func TestAFailureWhileASplitWritesItsPagesKeepsEveryEarlierKeyReadable(t *testing.T) {
 	hit := 0
-	for _, frames := range []int{1, 2} {
+	for _, frames := range []int{MinFrames(1), MinFrames(1) + 1} {
 		for _, preload := range []int{200, 400} {
 			for _, writes := range []bool{false, true} {
 				for at := 1; at <= 8; at++ {
@@ -358,7 +358,11 @@ func TestANodeThatExactlyFillsItsPageIsNotSplit(t *testing.T) {
 	if img.bytes() != nodepage.EntryArea {
 		t.Fatalf("test image holds %d bytes, want exactly %d", img.bytes(), nodepage.EntryArea)
 	}
-	if err := tr.split(nil, img); err != nil {
+	m := tr.Pool().Begin()
+	if err := tr.split(m, nil, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if h, err := tr.Height(); h != 1 || err != nil || src.Len() != 1 {

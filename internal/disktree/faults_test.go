@@ -16,7 +16,7 @@ func TestAFailedAllocationDuringASplitLeavesTheTreeUnchanged(t *testing.T) {
 	for failAt := 1; failAt <= 4; failAt++ {
 		mem := bufpool.NewMemSource()
 		fs := &faultSource{inner: mem}
-		pool := newPool(t, fs, 6, bufpool.LRU, bufpool.WriteBack)
+		pool := newPool(t, fs, MinFrames(5), bufpool.LRU, bufpool.WriteBack)
 		tr, _, err := Create(pool)
 		if err != nil {
 			t.Fatal(err)
@@ -78,7 +78,7 @@ func TestRandomDiskFailuresNeverLeavePinsOrPanic(t *testing.T) {
 	for seed := int64(0); seed < 3; seed++ {
 		r := rand.New(rand.NewSource(seed))
 		fs := &faultSource{inner: bufpool.NewMemSource()}
-		pool := newPool(t, fs, 4+int(seed), bufpool.Policy(seed), bufpool.Mode(seed%2))
+		pool := newPool(t, fs, MinFrames(2)+int(seed), bufpool.Policy(seed), bufpool.Mode(seed%2))
 		tr, _, err := Create(pool)
 		if err != nil {
 			t.Fatal(err)
@@ -152,10 +152,10 @@ func TestEveryAllocationReadAndWriteFailurePointUnpins(t *testing.T) {
 	}
 }
 
-func TestAReadFailureAfterASplitAllocatedFreesThePageAndLeavesTheTreeUnchanged(t *testing.T) {
+func TestAReadFailureWhileASplitLatchesItsPagesAllocatesNothingAndLeavesTheTreeUnchanged(t *testing.T) {
 	mem := bufpool.NewMemSource()
 	fs := &faultSource{inner: mem}
-	pool := newPool(t, fs, 2, bufpool.LRU, bufpool.WriteBack)
+	pool := newPool(t, fs, MinFrames(1), bufpool.LRU, bufpool.WriteBack)
 	tr, _, err := Create(pool)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +169,11 @@ func TestAReadFailureAfterASplitAllocatedFreesThePageAndLeavesTheTreeUnchanged(t
 		t.Fatalf("height %d, want 2", h)
 	}
 	pages := mem.Len()
-	fs.armReads = true
+	allocs := fs.allocs
+	tr.pause = onceAt("latch", func() {
+		evictRoot(t, tr)
+		fs.readsDead = true
+	})
 	var failed bool
 	for i := 1000; i < 2000; i++ {
 		err := tr.Put(k8(i), ridOf(i))
@@ -182,14 +186,14 @@ func TestAReadFailureAfterASplitAllocatedFreesThePageAndLeavesTheTreeUnchanged(t
 			break
 		}
 		model[string(k8(i))] = ridOf(i)
-		pages = mem.Len()
+		pages, allocs = mem.Len(), fs.allocs
 	}
 	if !failed {
 		t.Fatal("no split ever had to read its parent back")
 	}
-	fs.armReads, fs.readsDead = false, false
-	if mem.Len() != pages {
-		t.Fatalf("the failed split left %d new pages allocated", mem.Len()-pages)
+	fs.readsDead = false
+	if mem.Len() != pages || fs.allocs != allocs {
+		t.Fatalf("the failed split allocated %d pages and left %d allocated", fs.allocs-allocs, mem.Len()-pages)
 	}
 	mustValidate(t, tr)
 	checkModel(t, tr, model)

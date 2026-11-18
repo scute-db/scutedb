@@ -39,11 +39,6 @@ func (x *Index) Scan(from, to []byte) (index.Iterator, error) {
 	return x.t.Scan(from, to), nil
 }
 
-func (x *Index) Close() error {
-	if err := x.t.resume(); err != nil {
-		return err
-	}
-	return x.t.pool.FlushAll()
-}
+func (x *Index) Close() error { return x.t.pool.FlushAll() }
 
 var _ index.Index = (*Index)(nil)

@@ -1,9 +1,10 @@
 package disktree
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 
+	"github.com/scute-db/scutedb/internal/bufpool"
 	"github.com/scute-db/scutedb/internal/core"
 	"github.com/scute-db/scutedb/internal/nodepage"
 	"github.com/scute-db/scutedb/internal/page"
@@ -136,159 +137,162 @@ func (img image) halves(m int, rightID core.PageID) (image, image, []byte) {
 	return left, right, sep
 }
 
-type write struct {
-	id    core.PageID
-	bytes page.Page
-	fresh bool
+type level struct {
+	img   image
+	snap  page.Page
+	at    int
+	slot  int
+	frame *bufpool.Frame
+	left  *bufpool.Frame
+	right *bufpool.Frame
 }
 
-func (t *Tree) split(path []step, cur image) error {
-	var writes []write
-	var fresh []core.PageID
-	fail := func(err error) error {
-		var errs []error
-		for _, id := range fresh {
-			if ferr := t.pool.Free(id); ferr != nil {
-				errs = append(errs, ferr)
-			}
-		}
-		return errors.Join(append([]error{err}, errs...)...)
+func (t *Tree) split(m *bufpool.MTR, path []step, cur image) error {
+	t.at("split")
+	levels, err := t.plan(m, path, cur)
+	if err != nil {
+		return err
 	}
-	emit := func(img image, isNew bool) error {
-		b, err := img.render()
+	t.at("latch")
+	if err := t.claim(m, levels); err != nil {
+		return err
+	}
+	return t.apply(levels)
+}
+
+func (t *Tree) snapshot(m *bufpool.MTR, id core.PageID) (view, page.Page, error) {
+	v, err := t.read(m, id)
+	if err != nil {
+		return view{}, nil, err
+	}
+	return v, append(page.Page(nil), v.f.Page()...), nil
+}
+
+func (t *Tree) plan(m *bufpool.MTR, path []step, cur image) ([]level, error) {
+	v, snap, err := t.snapshot(m, cur.id)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.release(v, nil); err != nil {
+		return nil, err
+	}
+	var levels []level
+	slot := -1
+	for {
+		lv := level{img: cur, snap: snap, at: -1, slot: slot}
+		if cur.bytes() <= nodepage.EntryArea {
+			return append(levels, lv), nil
+		}
+		if lv.at = chooseSplit(cur); lv.at < 0 {
+			return nil, fmt.Errorf("%w: page %d with %d entries cannot be split", ErrCorrupt, cur.id, len(cur.entries))
+		}
+		levels = append(levels, lv)
+		if cur.id == t.root {
+			return levels, nil
+		}
+		up := path[len(path)-1]
+		path = path[:len(path)-1]
+		pv, psnap, err := t.snapshot(m, up.id)
+		if err != nil {
+			return nil, err
+		}
+		moved := int(pv.n.Level()) != int(cur.level)+1 || up.index > pv.n.KeyCount() || pv.n.Child(up.index) != cur.id
+		parent := readImage(pv.n)
+		if err := t.release(pv, nil); err != nil {
+			return nil, err
+		}
+		if moved {
+			return nil, fmt.Errorf("%w: page %d no longer points at page %d", ErrCorrupt, up.id, cur.id)
+		}
+		parent.insert(up.index, entry{key: cur.entries[lv.at].key})
+		slot, snap, cur = up.index, psnap, parent
+	}
+}
+
+func (t *Tree) claim(m *bufpool.MTR, levels []level) error {
+	for k := len(levels) - 1; k >= 0; k-- {
+		lv := &levels[k]
+		f, err := m.Fetch(lv.img.id)
 		if err != nil {
 			return err
 		}
-		writes = append(writes, write{id: img.id, bytes: b, fresh: isNew})
-		return nil
-	}
-	alloc := func(kind page.Kind) (core.PageID, error) {
-		f, err := t.pool.NewPage(kind)
-		if err != nil {
-			return 0, err
+		if err := m.WLatch(f); err != nil {
+			return err
 		}
-		id := f.ID()
-		fresh = append(fresh, id)
-		return id, t.unpin(f, false, nil)
-	}
-
-	for {
-		if cur.bytes() <= nodepage.EntryArea {
-			if err := emit(cur, false); err != nil {
-				return fail(err)
-			}
-			break
+		if !bytes.Equal(f.Page(), lv.snap) {
+			return fmt.Errorf("%w: page %d changed between planning a split and latching it", ErrCorrupt, lv.img.id)
 		}
-		m := chooseSplit(cur)
-		if m < 0 {
-			return fail(fmt.Errorf("%w: page %d with %d entries cannot be split", ErrCorrupt, cur.id, len(cur.entries)))
+		lv.frame = f
+	}
+	for k := range levels {
+		lv := &levels[k]
+		if lv.at < 0 {
+			continue
 		}
 		kind := page.KindBTreeInternal
-		if cur.leaf {
+		if lv.img.leaf {
 			kind = page.KindBTreeLeaf
 		}
-
-		if cur.id == t.root {
-			a, err := alloc(kind)
-			if err != nil {
-				return fail(err)
+		var err error
+		if lv.img.id == t.root {
+			if lv.left, err = fresh(m, kind); err != nil {
+				return err
 			}
-			b, err := alloc(kind)
-			if err != nil {
-				return fail(err)
-			}
-			left, right, sep := cur.halves(m, b)
-			left.id = a
-			root := image{id: t.root, level: cur.level + 1, link: a, entries: []entry{{key: sep, child: b}}}
-			for _, w := range []struct {
-				img   image
-				isNew bool
-			}{{left, true}, {right, true}, {root, false}} {
-				if err := emit(w.img, w.isNew); err != nil {
-					return fail(err)
-				}
-			}
-			break
 		}
-
-		b, err := alloc(kind)
-		if err != nil {
-			return fail(err)
+		if lv.right, err = fresh(m, kind); err != nil {
+			return err
 		}
-		left, right, sep := cur.halves(m, b)
-		if err := emit(right, true); err != nil {
-			return fail(err)
-		}
-		if err := emit(left, false); err != nil {
-			return fail(err)
-		}
-
-		up := path[len(path)-1]
-		path = path[:len(path)-1]
-		pf, pn, err := t.fetch(up.id)
-		if err != nil {
-			return fail(err)
-		}
-		moved := int(pn.Level()) != int(cur.level)+1 || up.index > pn.KeyCount() || pn.Child(up.index) != cur.id
-		parent := readImage(pn)
-		if err := t.unpin(pf, false, nil); err != nil {
-			return fail(err)
-		}
-		if moved {
-			return fail(fmt.Errorf("%w: page %d no longer points at page %d", ErrCorrupt, up.id, cur.id))
-		}
-		parent.insert(up.index, entry{key: sep, child: b})
-		cur = parent
 	}
-	t.pending = order(writes)
-	err := t.resume()
-	if untouched(t.pending, writes) {
-		t.pending = nil
-		return fail(err)
-	}
-	return err
+	return nil
 }
 
-func order(writes []write) []write {
-	var out []write
-	for _, w := range writes {
-		if w.fresh {
-			out = append(out, w)
-		}
+func fresh(m *bufpool.MTR, kind page.Kind) (*bufpool.Frame, error) {
+	f, err := m.NewPage(kind)
+	if err != nil {
+		return nil, err
 	}
-	for i := len(writes) - 1; i >= 0; i-- {
-		if !writes[i].fresh {
-			out = append(out, writes[i])
-		}
-	}
-	return out
+	return f, m.WLatch(f)
 }
 
-func untouched(pending, writes []write) bool {
-	old := 0
-	for _, w := range writes {
-		if !w.fresh {
-			old++
+func (t *Tree) apply(levels []level) error {
+	var below core.PageID
+	for k := range levels {
+		lv := &levels[k]
+		if lv.slot >= 0 {
+			lv.img.entries[lv.slot].child = below
 		}
+		if lv.at < 0 {
+			return draw(lv.frame, lv.img)
+		}
+		left, right, sep := lv.img.halves(lv.at, lv.right.ID())
+		if lv.img.id == t.root {
+			left.id = lv.left.ID()
+			root := image{id: t.root, level: lv.img.level + 1, link: left.id, entries: []entry{{key: sep, child: right.id}}}
+			if err := draw(lv.left, left); err != nil {
+				return err
+			}
+			if err := draw(lv.right, right); err != nil {
+				return err
+			}
+			return draw(lv.frame, root)
+		}
+		if err := draw(lv.right, right); err != nil {
+			return err
+		}
+		if err := draw(lv.frame, left); err != nil {
+			return err
+		}
+		below = right.id
 	}
-	return len(pending) > 0 && len(pending) >= old
+	return nil
 }
 
-func (t *Tree) resume() error {
-	var errs []error
-	for len(t.pending) > 0 {
-		w := t.pending[0]
-		f, err := t.pool.Fetch(w.id)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("scutedb/disktree: finishing a split at page %d: %w", w.id, err))
-			break
-		}
-		copy(f.Page(), w.bytes)
-		f.MarkVerified()
-		t.pending = t.pending[1:]
-		if err := t.unpin(f, true, nil); err != nil {
-			errs = append(errs, err)
-		}
+func draw(f *bufpool.Frame, img image) error {
+	p, err := img.render()
+	if err != nil {
+		return err
 	}
-	return errors.Join(errs...)
+	copy(f.Page(), p)
+	f.MarkVerified()
+	return nil
 }

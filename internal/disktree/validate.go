@@ -43,9 +43,8 @@ func (t *Tree) Validate() error {
 }
 
 func (t *Tree) Shape() (Shape, error) {
-	if err := t.resume(); err != nil {
-		return Shape{}, err
-	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.measure()
 }
 
@@ -78,18 +77,20 @@ func (w *walker) walk(id core.PageID, want int, low, high []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	w.t.pool.RLatch(f)
+	v := view{f: f, own: true}
 	n, err := nodepage.Load(f.Page())
 	if err == nil {
 		err = n.Validate()
 	}
 	if err != nil {
-		return 0, w.t.unpin(f, false, fmt.Errorf("%w: page %d: %w", ErrCorrupt, id, err))
+		return 0, w.t.release(v, fmt.Errorf("%w: page %d: %w", ErrCorrupt, id, err))
 	}
 	f.MarkVerified()
 	level := int(n.Level())
 	img := readImage(n)
 	used := n.UsedBytes()
-	if err := w.t.unpin(f, false, nil); err != nil {
+	if err := w.t.release(v, nil); err != nil {
 		return 0, err
 	}
 	if want >= 0 && level != want {
